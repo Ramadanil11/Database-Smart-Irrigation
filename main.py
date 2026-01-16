@@ -34,15 +34,15 @@ class ControlUpdate(BaseModel):
     target: Optional[str] = None
     minutes: Optional[int] = None
 
-# --- DATABASE CONNECTION ---
 def get_db_connection():
-    """Connect to Railway MySQL"""
+    """Connect to Railway MySQL using Environment Variables"""
     try:
         conn = mysql.connector.connect(
-            host=os.getenv('mysql.railway.internal', 'localhost'),
-            user=os.getenv('root', 'root'),
-            password=os.getenv('iSEQEeYOZUjEzUkBiShOSKACGOqguOuK', ''),
-            database=os.getenv('railway', 'railway'),
+            # Railway secara otomatis menyediakan variabel ini jika sudah di-link
+            host=os.getenv('mysql.railway.internal'),
+            user=os.getenv('root'),
+            password=os.getenv('iSEQEeYOZUjEzUkBiShOSKACGOqguOuK'),
+            database=os.getenv('railway'),
             port=int(os.getenv('3306', 3306)),
             autocommit=True,
             connect_timeout=10
