@@ -3,14 +3,15 @@ from datetime import datetime, time, timedelta
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import Optional
+from typing import Optional, List
 import mysql.connector
+from mysql.connector import Error
 from dotenv import load_dotenv
 import logging
 
 load_dotenv()
 
-app = FastAPI(title="Smart Irrigation API v3")
+app = FastAPI(title="Smart Irrigation API v4")
 
 # ========== LOGGING ==========
 logging.basicConfig(
@@ -44,55 +45,120 @@ class ScheduleData(BaseModel):
 
 class ControlUpdate(BaseModel):
     action: str  # "MANUAL_ON", "MANUAL_OFF", "AUTO", "PAUSE"
-    minutes: Optional[int] = None  # Untuk PAUSE
+    minutes: Optional[int] = None
 
 # ========== DATABASE ==========
 def get_db():
+    """Get database connection with retry logic"""
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            db = mysql.connector.connect(
+                host=os.getenv('MYSQLHOST'),
+                user=os.getenv('MYSQLUSER'),
+                password=os.getenv('MYSQLPASSWORD'),
+                database=os.getenv('MYSQLDATABASE'),
+                port=int(os.getenv('MYSQLPORT', 3306)),
+                autocommit=True,
+                connection_timeout=10
+            )
+            logger.info(f"✅ DB connected (attempt {attempt + 1})")
+            return db
+        except Error as e:
+            logger.error(f"❌ DB Error (attempt {attempt + 1}): {e}")
+            if attempt == max_retries - 1:
+                return None
+            
+def init_db():
+    """Initialize database tables if they don't exist"""
+    db = get_db()
+    if not db:
+        logger.error("❌ Cannot initialize DB")
+        return
+    
     try:
-        return mysql.connector.connect(
-            host=os.getenv('MYSQLHOST'),
-            user=os.getenv('MYSQLUSER'),
-            password=os.getenv('MYSQLPASSWORD'),
-            database=os.getenv('MYSQLDATABASE'),
-            port=int(os.getenv('MYSQLPORT', 3306)),
-            autocommit=True
-        )
-    except Exception as e:
-        logger.error(f"❌ DB Error: {e}")
-        return None
+        cursor = db.cursor()
+        
+        # Create pump_control table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS pump_control (
+                id INT PRIMARY KEY DEFAULT 1,
+                manual_mode VARCHAR(20) DEFAULT 'AUTO',
+                pause_end_time DATETIME NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+            )
+        """)
+        
+        # Create pump_schedules table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS pump_schedules (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                on_time TIME NOT NULL,
+                off_time TIME NOT NULL,
+                is_active BOOLEAN DEFAULT TRUE,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+            )
+        """)
+        
+        # Create sensor_data table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS sensor_data (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                moisture_level FLOAT NOT NULL,
+                water_level FLOAT NOT NULL,
+                pump_status VARCHAR(10) DEFAULT 'OFF',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        
+        # Insert default pump_control if not exists
+        cursor.execute("SELECT COUNT(*) FROM pump_control WHERE id = 1")
+        if cursor.fetchone()[0] == 0:
+            cursor.execute("""
+                INSERT INTO pump_control (id, manual_mode, pause_end_time)
+                VALUES (1, 'AUTO', NULL)
+            """)
+        
+        cursor.close()
+        logger.info("✅ Database initialized")
+    except Error as e:
+        logger.error(f"❌ Init DB Error: {e}")
+    finally:
+        db.close()
 
 # ========== HELPER FUNCTIONS ==========
 
 def parse_time(time_str: str) -> time:
     """Parse HH:MM:SS to time object"""
-    parts = time_str.split(':')
-    return time(int(parts[0]), int(parts[1]), int(parts[2]) if len(parts) > 2 else 0)
+    try:
+        parts = time_str.split(':')
+        return time(int(parts[0]), int(parts[1]), int(parts[2]) if len(parts) > 2 else 0)
+    except Exception as e:
+        logger.error(f"❌ Error parsing time {time_str}: {e}")
+        return time(0, 0, 0)
 
 def is_in_schedule(now_dt: datetime, on_str: str, off_str: str) -> bool:
     """Check if current time is within schedule"""
-    on_t = parse_time(on_str)
-    off_t = parse_time(off_str)
-    now_t = now_dt.time()
-    
-    if on_t <= off_t:
-        # Normal: 07:00 to 18:00
-        result = on_t <= now_t <= off_t
-    else:
-        # Overnight: 22:00 to 06:00
-        result = now_t >= on_t or now_t <= off_t
-    
-    logger.info(f"  Schedule check: {now_t} in {on_t}-{off_t} = {result}")
-    return result
+    try:
+        on_t = parse_time(on_str)
+        off_t = parse_time(off_str)
+        now_t = now_dt.time()
+        
+        if on_t <= off_t:
+            result = on_t <= now_t <= off_t
+        else:
+            result = now_t >= on_t or now_t <= off_t
+        
+        logger.info(f"  Schedule check: {now_t} in {on_t}-{off_t} = {result}")
+        return result
+    except Exception as e:
+        logger.error(f"❌ Error checking schedule: {e}")
+        return False
 
 def calculate_pump_status(db, now_dt: datetime) -> str:
-    """
-    LOGIC POMPA FINAL:
-    1. Jika PAUSE aktif → OFF
-    2. Jika MANUAL_ON → ON
-    3. Jika MANUAL_OFF → OFF
-    4. Jika AUTO → check schedule
-    5. Default → OFF
-    """
+    """Calculate final pump status based on priority"""
     logger.info(f"\n{'='*60}")
     logger.info(f"🔄 CALCULATING PUMP STATUS at {now_dt.strftime('%Y-%m-%d %H:%M:%S')}")
     logger.info(f"{'='*60}")
@@ -105,7 +171,8 @@ def calculate_pump_status(db, now_dt: datetime) -> str:
         control = cursor.fetchone()
         
         if not control:
-            logger.warning("⚠️  No control record found!")
+            logger.warning("⚠️ No control record found!")
+            cursor.close()
             return "OFF"
         
         logger.info(f"\n📊 Control State:")
@@ -154,7 +221,6 @@ def calculate_pump_status(db, now_dt: datetime) -> str:
             on_time = schedule['on_time']
             off_time = schedule['off_time']
             
-            # Convert to string if needed
             if hasattr(on_time, 'strftime'):
                 on_time = on_time.strftime('%H:%M:%S')
             if hasattr(off_time, 'strftime'):
@@ -175,17 +241,23 @@ def calculate_pump_status(db, now_dt: datetime) -> str:
             cursor.close()
             return "OFF"
     
-    except Exception as e:
+    except Error as e:
         logger.error(f"❌ Error calculating status: {e}")
+        cursor.close()
         return "OFF"
 
 # ========== ENDPOINTS ==========
+
+@app.on_event("startup")
+async def startup():
+    """Initialize database on startup"""
+    init_db()
 
 @app.get("/")
 async def root():
     return {
         "status": "online",
-        "version": "3.0",
+        "version": "4.0",
         "timestamp": get_local_time().isoformat()
     }
 
@@ -200,7 +272,10 @@ async def health():
             "server_time": get_local_time().isoformat(),
             "timezone": f"UTC+{TIMEZONE_OFFSET}"
         }
-    return {"status": "unhealthy", "database": "disconnected"}
+    return {
+        "status": "unhealthy",
+        "database": "disconnected"
+    }, 500
 
 @app.get("/api/sensor/latest")
 async def get_latest():
@@ -232,12 +307,15 @@ async def get_latest():
             "pump_status": "OFF",
             "created_at": None
         }
+    except Error as e:
+        logger.error(f"❌ Get latest error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
     finally:
         db.close()
 
 @app.get("/api/sensor/history")
 async def get_history(limit: int = 100):
-    """Get sensor history for 24 hours"""
+    """Get sensor history for chart"""
     db = get_db()
     if not db:
         raise HTTPException(status_code=500, detail="DB offline")
@@ -259,15 +337,15 @@ async def get_history(limit: int = 100):
             "pump_status": h['pump_status'],
             "time": h['created_at'].strftime("%H:%M") if h['created_at'] else ""
         } for h in rows]
+    except Error as e:
+        logger.error(f"❌ Get history error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
     finally:
         db.close()
 
 @app.post("/api/sensor/save")
 async def save_sensor(data: SensorData):
-    """
-    ESP32 sends sensor data
-    API calculates pump status and returns command
-    """
+    """Save sensor data and return pump command"""
     db = get_db()
     if not db:
         raise HTTPException(status_code=500, detail="DB offline")
@@ -279,10 +357,8 @@ async def save_sensor(data: SensorData):
         logger.info(f"   Moisture: {data.moisture_level}%")
         logger.info(f"   Water: {data.water_level}%")
         
-        # Calculate final pump status
         pump_status = calculate_pump_status(db, now)
         
-        # Save to database
         cursor = db.cursor()
         cursor.execute("""
             INSERT INTO sensor_data (moisture_level, water_level, pump_status)
@@ -298,22 +374,15 @@ async def save_sensor(data: SensorData):
             "command": pump_status,
             "timestamp": now.isoformat()
         }
-    
-    except Exception as e:
-        logger.error(f"❌ Error: {e}")
+    except Error as e:
+        logger.error(f"❌ Save sensor error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         db.close()
 
 @app.post("/api/control/update")
 async def update_control(update: ControlUpdate):
-    """
-    Update pump control:
-    - MANUAL_ON: Force pompa ON (ignore schedule)
-    - MANUAL_OFF: Force pompa OFF
-    - AUTO: Follow schedule
-    - PAUSE: Pause sistem untuk N menit
-    """
+    """Update pump control"""
     db = get_db()
     if not db:
         raise HTTPException(status_code=500, detail="DB offline")
@@ -329,12 +398,11 @@ async def update_control(update: ControlUpdate):
         cursor = db.cursor()
         
         if action == "PAUSE":
-            # Pause untuk N menit
             minutes = update.minutes or 30
             pause_until = now + timedelta(minutes=minutes)
             
             logger.info(f"⏸️  Pausing for {minutes} minutes")
-            logger.info(f"   Until: {pause_until.strftime('%H:%M:%S')}")
+            logger.info(f"   Until: {pause_until.strftime('%Y-%m-%d %H:%M:%S')}")
             
             cursor.execute("""
                 UPDATE pump_control 
@@ -363,16 +431,17 @@ async def update_control(update: ControlUpdate):
             result_msg = "Manual OFF"
         
         elif action == "AUTO":
-            logger.info(f"📅 Setting AUTO mode (schedule)")
+            logger.info(f"📅 Setting AUTO mode")
             cursor.execute("""
                 UPDATE pump_control 
                 SET manual_mode = 'AUTO', pause_end_time = NULL 
                 WHERE id = 1
             """)
-            result_msg = "Auto mode (schedule)"
+            result_msg = "Auto mode"
         
         else:
-            return {"status": "error", "detail": "Invalid action"}
+            cursor.close()
+            raise HTTPException(status_code=400, detail="Invalid action")
         
         cursor.close()
         
@@ -386,8 +455,8 @@ async def update_control(update: ControlUpdate):
             "timestamp": now.isoformat()
         }
     
-    except Exception as e:
-        logger.error(f"❌ Error: {e}")
+    except Error as e:
+        logger.error(f"❌ Update control error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         db.close()
@@ -407,10 +476,8 @@ async def add_schedule(data: ScheduleData):
         
         cursor = db.cursor()
         
-        # Delete old schedules
         cursor.execute("DELETE FROM pump_schedules")
         
-        # Insert new
         cursor.execute("""
             INSERT INTO pump_schedules (on_time, off_time, is_active)
             VALUES (%s, %s, TRUE)
@@ -427,8 +494,8 @@ async def add_schedule(data: ScheduleData):
             "off_time": data.off_time
         }
     
-    except Exception as e:
-        logger.error(f"❌ Error: {e}")
+    except Error as e:
+        logger.error(f"❌ Add schedule error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         db.close()
@@ -464,14 +531,20 @@ async def get_schedule():
                 "is_active": True
             }
         
-        return {"on_time": None, "off_time": None, "is_active": False}
-    
+        return {
+            "on_time": None,
+            "off_time": None,
+            "is_active": False
+        }
+    except Error as e:
+        logger.error(f"❌ Get schedule error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
     finally:
         db.close()
 
 @app.get("/api/control/status")
 async def get_control_status():
-    """Get current control state and calculated pump status"""
+    """Get current control state"""
     db = get_db()
     if not db:
         raise HTTPException(status_code=500, detail="DB offline")
@@ -482,20 +555,22 @@ async def get_control_status():
         cursor = db.cursor(dictionary=True)
         cursor.execute("SELECT * FROM pump_control WHERE id = 1")
         control = cursor.fetchone()
-        cursor.close()
         
         if not control:
-            return {"status": "error", "detail": "No control record"}
+            calculated_status = "OFF"
+        else:
+            calculated_status = calculate_pump_status(db, now)
         
-        # Calculate what pump SHOULD be
-        calculated_status = calculate_pump_status(db, now)
+        cursor.close()
         
         return {
-            "manual_mode": control['manual_mode'],
-            "pause_end_time": control['pause_end_time'].isoformat() if control['pause_end_time'] else None,
+            "manual_mode": control['manual_mode'] if control else "AUTO",
+            "pause_end_time": control['pause_end_time'].isoformat() if control and control['pause_end_time'] else None,
             "calculated_pump_status": calculated_status,
             "server_time": now.isoformat()
         }
-    
+    except Error as e:
+        logger.error(f"❌ Get control status error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
     finally:
         db.close()
