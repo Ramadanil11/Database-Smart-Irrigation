@@ -41,7 +41,7 @@ def get_db_connection():
             # Railway secara otomatis menyediakan variabel ini jika sudah di-link
             host=os.getenv('mysql.railway.internal'),
             user=os.getenv('root'),
-            password=os.getenv('iSEQEeYOZUjEzUkBiShOSKACGOqguOuK'),
+            password=os.getenv('JCwghfOwWAciwksxiYnNjPuCtPVbLNzk'),
             database=os.getenv('railway'),
             port=int(os.getenv('3306', 3306)),
             autocommit=True,
