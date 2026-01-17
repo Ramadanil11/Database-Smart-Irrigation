@@ -38,11 +38,11 @@ def get_db_connection():
     """Connect to Railway MySQL using standard Environment Variables"""
     try:
         # Menghapus parameter default agar tidak lari ke 'localhost'
-        db_host = os.getenv('mysql.railway.internal')
-        db_user = os.getenv('root')
-        db_pass = os.getenv('JCwghfOwWAciwksxiYnNjPuCtPVbLNzk')
-        db_name = os.getenv('railway')
-        db_port = os.getenv('3306', 3306)
+        db_host = os.getenv('MYSQLHOST')
+        db_user = os.getenv('MYSQLUSER')
+        db_pass = os.getenv('MYSQLPASSWORD')
+        db_name = os.getenv('MYSQLDATABASE')
+        db_port = os.getenv('MYSQLPORT', 3306)
 
         if not db_host:
             print("❌ Error: Variabel MYSQLHOST tidak ditemukan!")
