@@ -44,10 +44,10 @@ class ControlUpdate(BaseModel):
 def get_db_connection():
     """Connect to Railway MySQL"""
     try:
-        db_host = os.getenv('MYSQL_HOST', 'localhost')
-        db_user = os.getenv('MYSQL_USER', 'root')
-        db_pass = os.getenv('MYSQL_PASSWORD', '')
-        db_name = os.getenv('MYSQL_DATABASE', 'railway')
+        db_host = os.getenv('MYSQL_HOST')
+        db_user = os.getenv('MYSQL_USER')
+        db_pass = os.getenv('MYSQL_PASSWORD')
+        db_name = os.getenv('MYSQL_DATABASE')
         db_port = int(os.getenv('MYSQL_PORT', 3306))
 
         conn = mysql.connector.connect(
