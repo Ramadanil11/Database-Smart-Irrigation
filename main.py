@@ -35,15 +35,25 @@ class ControlUpdate(BaseModel):
     minutes: Optional[int] = None
 
 def get_db_connection():
-    """Connect to Railway MySQL using Environment Variables"""
+    """Connect to Railway MySQL using standard Environment Variables"""
     try:
+        # Menghapus parameter default agar tidak lari ke 'localhost'
+        db_host = os.getenv('mysql.railway.internal')
+        db_user = os.getenv('root')
+        db_pass = os.getenv('JCwghfOwWAciwksxiYnNjPuCtPVbLNzk')
+        db_name = os.getenv('railway')
+        db_port = os.getenv('3306', 3306)
+
+        if not db_host:
+            print("❌ Error: Variabel MYSQLHOST tidak ditemukan!")
+            return None
+
         conn = mysql.connector.connect(
-            # Railway secara otomatis menyediakan variabel ini jika sudah di-link
-            host=os.getenv('mysql.railway.internal'),
-            user=os.getenv('root'),
-            password=os.getenv('JCwghfOwWAciwksxiYnNjPuCtPVbLNzk'),
-            database=os.getenv('railway'),
-            port=int(os.getenv('3306', 3306)),
+            host=db_host,
+            user=db_user,
+            password=db_pass,
+            database=db_name,
+            port=int(db_port),
             autocommit=True,
             connect_timeout=10
         )
