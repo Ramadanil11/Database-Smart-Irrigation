@@ -42,23 +42,30 @@ class ControlUpdate(BaseModel):
     minutes: Optional[int] = None
 
 def get_db_connection():
-    """Connect to Railway MySQL"""
+    """Connect to Railway MySQL using standard Environment Variables"""
     try:
-        db_host = os.getenv('MYSQL_HOST')
-        db_user = os.getenv('MYSQL_USER')
-        db_pass = os.getenv('MYSQL_PASSWORD')
-        db_name = os.getenv('MYSQL_DATABASE')
-        db_port = int(os.getenv('MYSQL_PORT', 3306))
+        db_host = os.getenv('MYSQLHOST')
+        db_user = os.getenv('MYSQLUSER')
+        db_pass = os.getenv('MYSQLPASSWORD')
+        db_name = os.getenv('MYSQLDATABASE')
+        db_port = os.getenv('MYSQLPORT', 3306)
+
+        if not db_host:
+            print("❌ Error: Variabel MYSQLHOST tidak ditemukan!")
+            return None
+
+        print(f"Connecting to {db_host}:{db_port}/{db_name}")
 
         conn = mysql.connector.connect(
             host=db_host,
             user=db_user,
             password=db_pass,
             database=db_name,
-            port=db_port,
+            port=int(db_port),
             autocommit=True,
             connect_timeout=10
         )
+        print("✅ Database connected!")
         return conn
     except mysql.connector.Error as err:
         print(f"❌ Database Error: {err}")
