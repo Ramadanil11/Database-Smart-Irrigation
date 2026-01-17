@@ -52,6 +52,12 @@ def get_db_connection():
         print(f"❌ Database Error: {err}")
         return None
 
+if __name__ == "__main__":
+    import uvicorn
+    # Railway menggunakan variabel PORT secara dinamis
+    port = int(os.getenv("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
+
 # --- HELPERS ---
 def parse_time_str(t: str) -> time:
     """Parse HH:MM or HH:MM:SS"""
