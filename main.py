@@ -1,6 +1,6 @@
 import os
 from datetime import datetime, time, timedelta
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Optional
@@ -37,7 +37,6 @@ class ControlUpdate(BaseModel):
 def get_db_connection():
     """Connect to Railway MySQL using standard Environment Variables"""
     try:
-        # Menghapus parameter default agar tidak lari ke 'localhost'
         db_host = os.getenv('MYSQLHOST')
         db_user = os.getenv('MYSQLUSER')
         db_pass = os.getenv('MYSQLPASSWORD')
@@ -165,7 +164,6 @@ async def get_history(limit: int = 7):
         if not rows:
             return []
         
-        # Return oldest to newest
         rows.reverse()
         return [{
             "moisture": h['moisture_level'],
@@ -173,28 +171,6 @@ async def get_history(limit: int = 7):
             "pump_status": h['pump_status'],
             "time": h['created_at'].strftime("%H:%M") if h['created_at'] else "N/A"
         } for h in rows]
-    except Exception as e:
-        print(f"Error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        db.close()
-
-@app.post("/api/sensor/add")
-async def add_sensor_data(data: SensorData):
-    """Add sensor data manually"""
-    db = get_db_connection()
-    if not db:
-        raise HTTPException(status_code=500, detail="Database offline")
-    
-    try:
-        cursor = db.cursor()
-        cursor.execute("""
-            INSERT INTO sensor_data (moisture_level, water_level, pump_status)
-            VALUES (%s, %s, %s)
-        """, (data.moisture_level, data.water_level, data.pump_status))
-        cursor.close()
-        
-        return {"status": "data added"}
     except Exception as e:
         print(f"Error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -209,47 +185,35 @@ async def save_sensor_data(data: SensorData):
         raise HTTPException(status_code=500, detail="Database offline")
     
     try:
-        now = datetime.utcnow()
+        now = datetime.utcnow() + timedelta(hours=7) # Sesuaikan ke WIB jika perlu
         target_status = "OFF"
         
-        # Check manual control
         cursor = db.cursor(dictionary=True)
-        cursor.execute("SELECT manual_target, pause_until FROM pump_control LIMIT 1")
+        cursor.execute("SELECT manual_target, pause_until FROM pump_control ORDER BY id DESC LIMIT 1")
         ctrl = cursor.fetchone()
         
         if ctrl:
-            # Manual ON takes precedence
             if ctrl['manual_target'] == 'ON':
                 target_status = "ON"
             
-            # Pause overrides everything
             if ctrl['pause_until'] and now < ctrl['pause_until']:
                 target_status = "OFF"
             else:
-                # Clear expired pause
                 if ctrl['pause_until']:
                     cursor.execute("UPDATE pump_control SET pause_until = NULL")
         
-        # Check schedules if no manual ON
         if target_status != "ON":
-            cursor.execute("""
-                SELECT on_time, off_time FROM pump_schedules 
-                WHERE is_active = TRUE LIMIT 10
-            """)
+            cursor.execute("SELECT on_time, off_time FROM pump_schedules WHERE is_active = TRUE")
             schedules = cursor.fetchall()
-            
             for sched in schedules:
-                if sched['on_time'] and sched['off_time']:
-                    if is_now_between(sched['on_time'], sched['off_time'], now):
-                        target_status = "ON"
-                        break
+                if is_now_between(sched['on_time'], sched['off_time'], now):
+                    target_status = "ON"
+                    break
         
-        # Save sensor data
         cursor.execute("""
             INSERT INTO sensor_data (moisture_level, water_level, pump_status)
             VALUES (%s, %s, %s)
         """, (data.moisture_level, data.water_level, target_status))
-        cursor.close()
         
         return {"status": "success", "command": target_status}
     except Exception as e:
@@ -260,101 +224,83 @@ async def save_sensor_data(data: SensorData):
 
 @app.post("/api/control/update")
 async def update_control(control: ControlUpdate):
-    """Update pump control"""
-    db = get_db_connection()
-    if not db:
-        raise HTTPException(status_code=500, detail="Database offline")
-    
-    try:
-        cursor = db.cursor()
-        
-        if control.type == "manual":
-            # Set manual target
-            cursor.execute("""
-                UPDATE pump_control SET manual_target = %s, pause_until = NULL
-                WHERE id = (SELECT MAX(id) FROM pump_control)
-            """, (control.target.upper() if control.target else "OFF",))
-        
-        elif control.type == "pause":
-            # Set pause duration
-            pause_until = datetime.utcnow() + timedelta(minutes=control.minutes or 0)
-            cursor.execute("""
-                UPDATE pump_control SET pause_until = %s
-                WHERE id = (SELECT MAX(id) FROM pump_control)
-            """, (pause_until,))
-        
-        cursor.close()
-        return {"status": "success"}
-    except Exception as e:
-        print(f"Error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        db.close()
-
-@app.post("/api/schedule/add")
-async def add_schedule(schedule: ScheduleData):
-    """Add pump schedule"""
-    db = get_db_connection()
-    if not db:
-        raise HTTPException(status_code=500, detail="Database offline")
-    
-    try:
-        cursor = db.cursor()
-        
-        # Deactivate all and add new
-        cursor.execute("UPDATE pump_schedules SET is_active = FALSE")
-        cursor.execute("""
-            INSERT INTO pump_schedules (on_time, off_time, is_active)
-            VALUES (%s, %s, TRUE)
-        """, (schedule.on_time, schedule.off_time))
-        
-        cursor.close()
-        return {"status": "schedule added"}
-    except Exception as e:
-        print(f"Error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        db.close()
-
-@app.get("/api/schedule/list")
-async def get_schedules():
-    """Get active schedules"""
+    """Update pump control - FIXED for MySQL 1093 error and consistency"""
     db = get_db_connection()
     if not db:
         raise HTTPException(status_code=500, detail="Database offline")
     
     try:
         cursor = db.cursor(dictionary=True)
-        cursor.execute("""
-            SELECT id, on_time, off_time, is_active 
-            FROM pump_schedules 
-            WHERE is_active = TRUE
-        """)
-        schedules = cursor.fetchall()
-        cursor.close()
         
-        return schedules if schedules else []
+        # Ambil ID terakhir dulu untuk menghindari error subquery
+        cursor.execute("SELECT id FROM pump_control ORDER BY id DESC LIMIT 1")
+        row = cursor.fetchone()
+        
+        if not row:
+            # Jika tabel kosong, masukkan data pertama
+            cursor.execute("INSERT INTO pump_control (manual_target) VALUES ('OFF')")
+            last_id = cursor.lastrowid
+        else:
+            last_id = row['id']
+
+        if control.type == "manual":
+            target = control.target.upper() if control.target else "OFF"
+            cursor.execute("""
+                UPDATE pump_control 
+                SET manual_target = %s, pause_until = NULL 
+                WHERE id = %s
+            """, (target, last_id))
+        
+        elif control.type == "pause":
+            # Waktu sekarang + durasi (Gunakan UTC agar konsisten dengan server)
+            pause_until = datetime.utcnow() + timedelta(minutes=control.minutes or 0)
+            cursor.execute("""
+                UPDATE pump_control 
+                SET pause_until = %s, manual_target = 'OFF' 
+                WHERE id = %s
+            """, (pause_until, last_id))
+        
+        return {"status": "success"}
     except Exception as e:
-        print(f"Error: {e}")
+        print(f"❌ Error update_control: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        db.close()
+
+@app.post("/api/schedule/add")
+async def add_schedule(schedule: ScheduleData):
+    db = get_db_connection()
+    if not db:
+        raise HTTPException(status_code=500, detail="Database offline")
+    try:
+        cursor = db.cursor()
+        cursor.execute("UPDATE pump_schedules SET is_active = FALSE")
+        cursor.execute("""
+            INSERT INTO pump_schedules (on_time, off_time, is_active)
+            VALUES (%s, %s, TRUE)
+        """, (schedule.on_time, schedule.off_time))
+        return {"status": "schedule added"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        db.close()
+
+@app.get("/api/schedule/list")
+async def get_schedules():
+    db = get_db_connection()
+    try:
+        cursor = db.cursor(dictionary=True)
+        cursor.execute("SELECT id, on_time, off_time, is_active FROM pump_schedules WHERE is_active = TRUE")
+        return cursor.fetchall()
     finally:
         db.close()
 
 @app.delete("/api/schedule/{schedule_id}")
 async def delete_schedule(schedule_id: int):
-    """Delete schedule"""
     db = get_db_connection()
-    if not db:
-        raise HTTPException(status_code=500, detail="Database offline")
-    
     try:
         cursor = db.cursor()
         cursor.execute("UPDATE pump_schedules SET is_active = FALSE WHERE id = %s", (schedule_id,))
-        cursor.close()
-        
         return {"status": "schedule deleted"}
-    except Exception as e:
-        print(f"Error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
     finally:
         db.close()
