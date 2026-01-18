@@ -11,7 +11,7 @@ import logging
 
 load_dotenv()
 
-app = FastAPI(title="Smart Irrigation API v5")
+app = FastAPI(title="Smart Irrigation API v6")
 
 # ========== LOGGING ==========
 logging.basicConfig(
@@ -40,16 +40,15 @@ class SensorData(BaseModel):
     water_level: float
 
 class ScheduleData(BaseModel):
-    on_time: str  # "HH:MM:SS"
-    off_time: str  # "HH:MM:SS"
+    on_time: str
+    off_time: str
 
 class ControlUpdate(BaseModel):
-    action: str  # "MANUAL_ON", "MANUAL_OFF", "AUTO", "PAUSE"
+    action: str
     minutes: Optional[int] = None
 
 # ========== DATABASE ==========
 def get_db():
-    """Get database connection with retry logic"""
     max_retries = 3
     for attempt in range(max_retries):
         try:
@@ -70,50 +69,46 @@ def get_db():
                 return None
 
 def migrate_db():
-    """Migrate/update database schema"""
     db = get_db()
     if not db:
-        logger.error("❌ Cannot migrate DB - connection failed")
+        logger.error("❌ Cannot migrate DB")
         return
     
     try:
         cursor = db.cursor()
         
-        # Check if pump_control has manual_mode column
         cursor.execute("""
             SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS 
             WHERE TABLE_NAME='pump_control' AND COLUMN_NAME='manual_mode'
         """)
         
         if not cursor.fetchone():
-            logger.info("📝 Adding manual_mode column to pump_control...")
+            logger.info("📝 Adding manual_mode column...")
             try:
                 cursor.execute("""
                     ALTER TABLE pump_control 
                     ADD COLUMN manual_mode VARCHAR(20) DEFAULT 'AUTO'
                 """)
-                logger.info("✅ manual_mode column added")
+                logger.info("✅ manual_mode added")
             except Error as e:
                 logger.warning(f"⚠️ Could not add manual_mode: {e}")
         
-        # Check if pump_control has pause_end_time column
         cursor.execute("""
             SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS 
             WHERE TABLE_NAME='pump_control' AND COLUMN_NAME='pause_end_time'
         """)
         
         if not cursor.fetchone():
-            logger.info("📝 Adding pause_end_time column to pump_control...")
+            logger.info("📝 Adding pause_end_time column...")
             try:
                 cursor.execute("""
                     ALTER TABLE pump_control 
                     ADD COLUMN pause_end_time DATETIME NULL
                 """)
-                logger.info("✅ pause_end_time column added")
+                logger.info("✅ pause_end_time added")
             except Error as e:
                 logger.warning(f"⚠️ Could not add pause_end_time: {e}")
         
-        # Ensure default record exists in pump_control
         cursor.execute("SELECT COUNT(*) FROM pump_control WHERE id = 1")
         count = cursor.fetchone()[0]
         
@@ -124,9 +119,9 @@ def migrate_db():
                     INSERT INTO pump_control (id, manual_mode, pause_end_time)
                     VALUES (1, 'AUTO', NULL)
                 """)
-                logger.info("✅ Default pump_control record inserted")
+                logger.info("✅ Default record inserted")
             except Error as e:
-                logger.warning(f"⚠️ Could not insert default record: {e}")
+                logger.warning(f"⚠️ Could not insert: {e}")
         
         cursor.close()
         logger.info("✅ Database migration completed")
@@ -139,7 +134,6 @@ def migrate_db():
 # ========== HELPER FUNCTIONS ==========
 
 def parse_time(time_str: str) -> time:
-    """Parse HH:MM:SS to time object"""
     try:
         parts = time_str.split(':')
         return time(int(parts[0]), int(parts[1]), int(parts[2]) if len(parts) > 2 else 0)
@@ -148,7 +142,6 @@ def parse_time(time_str: str) -> time:
         return time(0, 0, 0)
 
 def is_in_schedule(now_dt: datetime, on_str: str, off_str: str) -> bool:
-    """Check if current time is within schedule"""
     try:
         on_t = parse_time(on_str)
         off_t = parse_time(off_str)
@@ -166,7 +159,7 @@ def is_in_schedule(now_dt: datetime, on_str: str, off_str: str) -> bool:
         return False
 
 def calculate_pump_status(db, now_dt: datetime) -> str:
-    """Calculate final pump status based on priority"""
+    """Calculate final pump status with fixed logic"""
     logger.info(f"\n{'='*60}")
     logger.info(f"🔄 CALCULATING PUMP STATUS at {now_dt.strftime('%Y-%m-%d %H:%M:%S')}")
     logger.info(f"{'='*60}")
@@ -174,7 +167,7 @@ def calculate_pump_status(db, now_dt: datetime) -> str:
     try:
         cursor = db.cursor(dictionary=True)
         
-        # Get current control state
+        # Get control state
         cursor.execute("SELECT * FROM pump_control WHERE id = 1")
         control = cursor.fetchone()
         
@@ -187,32 +180,36 @@ def calculate_pump_status(db, now_dt: datetime) -> str:
         logger.info(f"   manual_mode: {control.get('manual_mode', 'AUTO')}")
         logger.info(f"   pause_end_time: {control.get('pause_end_time')}")
         
-        # PRIORITY 1: Check if PAUSE is active
+        # PRIORITY 1: Check PAUSE (only blocks AUTO mode, not MANUAL_ON)
         pause_end_time = control.get('pause_end_time')
         if pause_end_time:
             logger.info(f"\n⏸️  [PRIORITY 1] PAUSE CHECK:")
             logger.info(f"   Pause until: {pause_end_time}")
             logger.info(f"   Now: {now_dt}")
             
-            # Convert pause_end_time to datetime if it's a time object
             if hasattr(pause_end_time, 'replace'):
-                # It's a datetime object
                 pause_dt = pause_end_time
             else:
-                # Convert string to datetime
                 pause_dt = datetime.fromisoformat(str(pause_end_time))
             
             if now_dt < pause_dt:
-                logger.info(f"   ✓ PAUSE ACTIVE → Return OFF")
-                cursor.close()
-                return "OFF"
+                # Pause active - check if MANUAL_ON (override pause)
+                manual_mode = control.get('manual_mode', 'AUTO')
+                if manual_mode == 'MANUAL_ON':
+                    logger.info(f"   ⚠️ PAUSE active but MANUAL_ON override → Return ON")
+                    cursor.close()
+                    return "ON"
+                else:
+                    logger.info(f"   ✓ PAUSE ACTIVE → Return OFF")
+                    cursor.close()
+                    return "OFF"
             else:
                 logger.info(f"   ✓ Pause expired, clearing...")
                 cursor.execute("""
                     UPDATE pump_control SET pause_end_time = NULL WHERE id = 1
                 """)
         
-        # PRIORITY 2: Check MANUAL mode
+        # PRIORITY 2: Check MANUAL mode (overrides everything except PAUSE)
         manual_mode = control.get('manual_mode', 'AUTO')
         logger.info(f"\n🔧 [PRIORITY 2] MANUAL MODE CHECK:")
         logger.info(f"   manual_mode: {manual_mode}")
@@ -267,7 +264,6 @@ def calculate_pump_status(db, now_dt: datetime) -> str:
 
 @app.on_event("startup")
 async def startup():
-    """Migrate database on startup"""
     logger.info("🚀 Starting Smart Irrigation API...")
     migrate_db()
 
@@ -275,7 +271,7 @@ async def startup():
 async def root():
     return {
         "status": "online",
-        "version": "5.0",
+        "version": "6.0",
         "timestamp": get_local_time().isoformat()
     }
 
@@ -290,14 +286,10 @@ async def health():
             "server_time": get_local_time().isoformat(),
             "timezone": f"UTC+{TIMEZONE_OFFSET}"
         }
-    return {
-        "status": "unhealthy",
-        "database": "disconnected"
-    }
+    return {"status": "unhealthy", "database": "disconnected"}
 
 @app.get("/api/sensor/latest")
 async def get_latest():
-    """Get latest sensor data"""
     db = get_db()
     if not db:
         raise HTTPException(status_code=500, detail="DB offline")
@@ -333,7 +325,6 @@ async def get_latest():
 
 @app.get("/api/sensor/history")
 async def get_history(limit: int = 100):
-    """Get sensor history for chart"""
     db = get_db()
     if not db:
         raise HTTPException(status_code=500, detail="DB offline")
@@ -363,7 +354,6 @@ async def get_history(limit: int = 100):
 
 @app.post("/api/sensor/save")
 async def save_sensor(data: SensorData):
-    """Save sensor data and return pump command"""
     db = get_db()
     if not db:
         raise HTTPException(status_code=500, detail="DB offline")
@@ -400,7 +390,6 @@ async def save_sensor(data: SensorData):
 
 @app.post("/api/control/update")
 async def update_control(update: ControlUpdate):
-    """Update pump control"""
     db = get_db()
     if not db:
         raise HTTPException(status_code=500, detail="DB offline")
@@ -481,7 +470,6 @@ async def update_control(update: ControlUpdate):
 
 @app.post("/api/schedule/add")
 async def add_schedule(data: ScheduleData):
-    """Add or update schedule"""
     db = get_db()
     if not db:
         raise HTTPException(status_code=500, detail="DB offline")
@@ -494,10 +482,8 @@ async def add_schedule(data: ScheduleData):
         
         cursor = db.cursor()
         
-        # Delete old schedules
         cursor.execute("DELETE FROM pump_schedules")
         
-        # Insert new
         cursor.execute("""
             INSERT INTO pump_schedules (on_time, off_time, is_active)
             VALUES (%s, %s, TRUE)
@@ -522,7 +508,6 @@ async def add_schedule(data: ScheduleData):
 
 @app.get("/api/schedule/list")
 async def get_schedule():
-    """Get current schedule"""
     db = get_db()
     if not db:
         raise HTTPException(status_code=500, detail="DB offline")
@@ -564,7 +549,6 @@ async def get_schedule():
 
 @app.get("/api/control/status")
 async def get_control_status():
-    """Get current control state"""
     db = get_db()
     if not db:
         raise HTTPException(status_code=500, detail="DB offline")
