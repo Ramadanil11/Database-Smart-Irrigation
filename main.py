@@ -1,584 +1,487 @@
-import os
-from datetime import datetime, time, timedelta
-from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from typing import Optional
-import mysql.connector
-from mysql.connector import Error
-from dotenv import load_dotenv
-import logging
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <ArduinoJson.h>
+#include <HTTPClient.h>
+#include <SPIFFS.h>
+#include <WebServer.h>
+#include "RTClib.h"
 
-load_dotenv()
+// ========== SPIFFS CONFIG ==========
+#define CONFIG_FILE "/wifi_config.json"
 
-app = FastAPI(title="Smart Irrigation API v6")
+// ========== WIFI CONFIG ==========
+String wifiSSID = "";
+String wifiPassword = "";
+String apiBaseUrl = "https://database-smart-irrigation-production.up.railway.app";
 
-# ========== LOGGING ==========
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
+// ========== GLOBAL ==========
+WiFiClientSecure client;
+RTC_DS3231 rtc;
+WebServer configServer(80);
 
-# ========== CORS MIDDLEWARE ==========
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+// ========== PIN CONFIGURATION ==========
+const int PIN_RELAY = 16;
+const int PIN_SOIL = 14;
+const int PIN_WATER = 13;
+const int PIN_LED = 2;
 
-# ========== TIMEZONE ==========
-TIMEZONE_OFFSET = 7
+#define POMPA_ON HIGH
+#define POMPA_OFF LOW
 
-def get_local_time():
-    return datetime.utcnow() + timedelta(hours=TIMEZONE_OFFSET)
+// ========== TIMING ==========
+unsigned long lastSensorUpdate = 0;
+unsigned long lastStatusCheck = 0;
+unsigned long lastBlink = 0;
+const unsigned long SENSOR_INTERVAL = 5000;
+const unsigned long STATUS_INTERVAL = 3000;
+const unsigned long BLINK_INTERVAL = 500;
 
-# ========== MODELS ==========
-class SensorData(BaseModel):
-    moisture_level: float
-    water_level: float
+// ========== STATE ==========
+String pumpStatus = "OFF";
+bool isPaused = false;
+bool isConfigMode = false;
+bool isWiFiConnected = false;
+bool ledState = false;
 
-class ScheduleData(BaseModel):
-    on_time: str
-    off_time: str
+// ========== FORWARD DECLARATIONS ==========
+void handleRoot();
+void handleSaveWiFi();
+void handleGetStatus();
+void handleResetWiFi();
 
-class ControlUpdate(BaseModel):
-    action: str
-    minutes: Optional[int] = None
+void initSPIFFS() {
+  if (!SPIFFS.begin(true)) {
+    Serial.println("❌ SPIFFS failed");
+    return;
+  }
+  Serial.println("✅ SPIFFS OK");
+}
 
-# ========== DATABASE ==========
-def get_db():
-    max_retries = 3
-    for attempt in range(max_retries):
-        try:
-            db = mysql.connector.connect(
-                host=os.getenv('MYSQLHOST'),
-                user=os.getenv('MYSQLUSER'),
-                password=os.getenv('MYSQLPASSWORD'),
-                database=os.getenv('MYSQLDATABASE'),
-                port=int(os.getenv('MYSQLPORT', 3306)),
-                autocommit=True,
-                connection_timeout=10
-            )
-            logger.info(f"✅ DB connected (attempt {attempt + 1})")
-            return db
-        except Error as e:
-            logger.error(f"❌ DB Error (attempt {attempt + 1}): {e}")
-            if attempt == max_retries - 1:
-                return None
+void loadWiFiConfig() {
+  if (!SPIFFS.exists(CONFIG_FILE)) {
+    Serial.println("⚠️ Config file not found");
+    return;
+  }
 
-def migrate_db():
-    db = get_db()
-    if not db:
-        logger.error("❌ Cannot migrate DB")
-        return
+  File file = SPIFFS.open(CONFIG_FILE, "r");
+  StaticJsonDocument<300> doc;
+  
+  if (deserializeJson(doc, file) == DeserializationError::Ok) {
+    wifiSSID = doc["ssid"].as<String>();
+    wifiPassword = doc["password"].as<String>();
+    apiBaseUrl = doc["api_url"].as<String>();
     
-    try:
-        cursor = db.cursor()
-        
-        cursor.execute("""
-            SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS 
-            WHERE TABLE_NAME='pump_control' AND COLUMN_NAME='manual_mode'
-        """)
-        
-        if not cursor.fetchone():
-            logger.info("📝 Adding manual_mode column...")
-            try:
-                cursor.execute("""
-                    ALTER TABLE pump_control 
-                    ADD COLUMN manual_mode VARCHAR(20) DEFAULT 'AUTO'
-                """)
-                logger.info("✅ manual_mode added")
-            except Error as e:
-                logger.warning(f"⚠️ Could not add manual_mode: {e}")
-        
-        cursor.execute("""
-            SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS 
-            WHERE TABLE_NAME='pump_control' AND COLUMN_NAME='pause_end_time'
-        """)
-        
-        if not cursor.fetchone():
-            logger.info("📝 Adding pause_end_time column...")
-            try:
-                cursor.execute("""
-                    ALTER TABLE pump_control 
-                    ADD COLUMN pause_end_time DATETIME NULL
-                """)
-                logger.info("✅ pause_end_time added")
-            except Error as e:
-                logger.warning(f"⚠️ Could not add pause_end_time: {e}")
-        
-        cursor.execute("SELECT COUNT(*) FROM pump_control WHERE id = 1")
-        count = cursor.fetchone()[0]
-        
-        if count == 0:
-            logger.info("📝 Inserting default pump_control record...")
-            try:
-                cursor.execute("""
-                    INSERT INTO pump_control (id, manual_mode, pause_end_time)
-                    VALUES (1, 'AUTO', NULL)
-                """)
-                logger.info("✅ Default record inserted")
-            except Error as e:
-                logger.warning(f"⚠️ Could not insert: {e}")
-        
-        cursor.close()
-        logger.info("✅ Database migration completed")
-    
-    except Error as e:
-        logger.error(f"❌ Migration error: {e}")
-    finally:
-        db.close()
+    Serial.println("✅ Config loaded");
+    Serial.println("📡 SSID: " + wifiSSID);
+  }
+  file.close();
+}
 
-# ========== HELPER FUNCTIONS ==========
+void saveWiFiConfig(String ssid, String password) {
+  StaticJsonDocument<300> doc;
+  doc["ssid"] = ssid;
+  doc["password"] = password;
+  doc["api_url"] = apiBaseUrl;
 
-def parse_time(time_str: str) -> time:
-    try:
-        parts = time_str.split(':')
-        return time(int(parts[0]), int(parts[1]), int(parts[2]) if len(parts) > 2 else 0)
-    except Exception as e:
-        logger.error(f"❌ Error parsing time {time_str}: {e}")
-        return time(0, 0, 0)
+  File file = SPIFFS.open(CONFIG_FILE, "w");
+  serializeJson(doc, file);
+  file.close();
+  
+  Serial.println("✅ WiFi config saved");
+}
 
-def is_in_schedule(now_dt: datetime, on_str: str, off_str: str) -> bool:
-    try:
-        on_t = parse_time(on_str)
-        off_t = parse_time(off_str)
-        now_t = now_dt.time()
-        
-        if on_t <= off_t:
-            result = on_t <= now_t <= off_t
-        else:
-            result = now_t >= on_t or now_t <= off_t
-        
-        logger.info(f"  Schedule check: {now_t} in {on_t}-{off_t} = {result}")
-        return result
-    except Exception as e:
-        logger.error(f"❌ Error checking schedule: {e}")
-        return False
+void startConfigMode() {
+  isConfigMode = true;
+  Serial.println("\n⚙️ CONFIG MODE");
+  
+  // AP Mode
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP("Smart-Irrigation-Setup", "password123");
+  
+  Serial.println("📱 AP: Smart-Irrigation-Setup");
+  Serial.println("🔐 Password: password123");
+  Serial.println("🌐 IP: 192.168.4.1");
 
-def calculate_pump_status(db, now_dt: datetime) -> str:
-    """Calculate final pump status with fixed logic"""
-    logger.info(f"\n{'='*60}")
-    logger.info(f"🔄 CALCULATING PUMP STATUS at {now_dt.strftime('%Y-%m-%d %H:%M:%S')}")
-    logger.info(f"{'='*60}")
-    
-    try:
-        cursor = db.cursor(dictionary=True)
+  configServer.on("/", HTTP_GET, handleRoot);
+  configServer.on("/save-wifi", HTTP_POST, handleSaveWiFi);
+  configServer.on("/status", HTTP_GET, handleGetStatus);
+  configServer.on("/reset", HTTP_POST, handleResetWiFi);
+  
+  configServer.begin();
+  Serial.println("✅ Web server started");
+}
+
+void handleRoot() {
+  String html = R"(
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Smart Irrigation WiFi Setup</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+        }
+        .container {
+            background: white;
+            border-radius: 16px;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+            padding: 40px;
+            max-width: 450px;
+            width: 100%;
+        }
+        h1 {
+            color: #333;
+            margin-bottom: 8px;
+            font-size: 28px;
+        }
+        .subtitle {
+            color: #666;
+            font-size: 14px;
+            margin-bottom: 30px;
+        }
+        .form-group {
+            margin-bottom: 20px;
+        }
+        label {
+            display: block;
+            color: #333;
+            font-weight: 600;
+            margin-bottom: 8px;
+            font-size: 14px;
+        }
+        input {
+            width: 100%;
+            padding: 12px;
+            border: 2px solid #e0e0e0;
+            border-radius: 8px;
+            font-size: 14px;
+            transition: border-color 0.3s;
+        }
+        input:focus {
+            outline: none;
+            border-color: #667eea;
+        }
+        button {
+            width: 100%;
+            padding: 12px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border: none;
+            border-radius: 8px;
+            font-size: 16px;
+            font-weight: 600;
+            cursor: pointer;
+            margin-top: 20px;
+            transition: transform 0.2s;
+        }
+        button:hover { transform: translateY(-2px); }
+        .message {
+            padding: 12px;
+            border-radius: 8px;
+            margin-top: 15px;
+            text-align: center;
+            font-size: 14px;
+            display: none;
+        }
+        .message.show { display: block; }
+        .success {
+            background: #d4edda;
+            color: #155724;
+            border: 1px solid #c3e6cb;
+        }
+        .error {
+            background: #f8d7da;
+            color: #721c24;
+            border: 1px solid #f5c6cb;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>💧 Smart Irrigation</h1>
+        <p class="subtitle">Konfigurasi Koneksi WiFi</p>
         
-        # Get control state
-        cursor.execute("SELECT * FROM pump_control WHERE id = 1")
-        control = cursor.fetchone()
-        
-        if not control:
-            logger.warning("⚠️ No control record found!")
-            cursor.close()
-            return "OFF"
-        
-        logger.info(f"\n📊 Control State:")
-        logger.info(f"   manual_mode: {control.get('manual_mode', 'AUTO')}")
-        logger.info(f"   pause_end_time: {control.get('pause_end_time')}")
-        
-        # PRIORITY 1: Check PAUSE (only blocks AUTO mode, not MANUAL_ON)
-        pause_end_time = control.get('pause_end_time')
-        if pause_end_time:
-            logger.info(f"\n⏸️  [PRIORITY 1] PAUSE CHECK:")
-            logger.info(f"   Pause until: {pause_end_time}")
-            logger.info(f"   Now: {now_dt}")
+        <form id="wifiForm">
+            <div class="form-group">
+                <label for="ssid">📡 Nama WiFi (SSID)</label>
+                <input type="text" id="ssid" placeholder="Masukkan nama WiFi Anda" required>
+            </div>
             
-            if hasattr(pause_end_time, 'replace'):
-                pause_dt = pause_end_time
-            else:
-                pause_dt = datetime.fromisoformat(str(pause_end_time))
+            <div class="form-group">
+                <label for="password">🔑 Password WiFi</label>
+                <input type="password" id="password" placeholder="Masukkan password WiFi" required>
+            </div>
             
-            if now_dt < pause_dt:
-                # Pause active - check if MANUAL_ON (override pause)
-                manual_mode = control.get('manual_mode', 'AUTO')
-                if manual_mode == 'MANUAL_ON':
-                    logger.info(f"   ⚠️ PAUSE active but MANUAL_ON override → Return ON")
-                    cursor.close()
-                    return "ON"
-                else:
-                    logger.info(f"   ✓ PAUSE ACTIVE → Return OFF")
-                    cursor.close()
-                    return "OFF"
-            else:
-                logger.info(f"   ✓ Pause expired, clearing...")
-                cursor.execute("""
-                    UPDATE pump_control SET pause_end_time = NULL WHERE id = 1
-                """)
+            <button type="submit">✅ Simpan & Koneksi</button>
+        </form>
         
-        # PRIORITY 2: Check MANUAL mode (overrides everything except PAUSE)
-        manual_mode = control.get('manual_mode', 'AUTO')
-        logger.info(f"\n🔧 [PRIORITY 2] MANUAL MODE CHECK:")
-        logger.info(f"   manual_mode: {manual_mode}")
-        
-        if manual_mode == 'MANUAL_ON':
-            logger.info(f"   ✓ MANUAL_ON → Return ON")
-            cursor.close()
-            return "ON"
-        elif manual_mode == 'MANUAL_OFF':
-            logger.info(f"   ✓ MANUAL_OFF → Return OFF")
-            cursor.close()
-            return "OFF"
-        
-        # PRIORITY 3: Check AUTO (Schedule)
-        logger.info(f"\n📅 [PRIORITY 3] AUTO MODE (SCHEDULE) CHECK:")
-        cursor.execute("""
-            SELECT on_time, off_time FROM pump_schedules 
-            WHERE is_active = TRUE ORDER BY id DESC LIMIT 1
-        """)
-        schedule = cursor.fetchone()
-        
-        if schedule:
-            on_time = schedule['on_time']
-            off_time = schedule['off_time']
-            
-            if hasattr(on_time, 'strftime'):
-                on_time = on_time.strftime('%H:%M:%S')
-            if hasattr(off_time, 'strftime'):
-                off_time = off_time.strftime('%H:%M:%S')
-            
-            logger.info(f"   Schedule found: {on_time} - {off_time}")
-            
-            if is_in_schedule(now_dt, on_time, off_time):
-                logger.info(f"   ✓ Within schedule → Return ON")
-                cursor.close()
-                return "ON"
-            else:
-                logger.info(f"   ✓ Outside schedule → Return OFF")
-                cursor.close()
-                return "OFF"
-        else:
-            logger.info(f"   No schedule found → Return OFF")
-            cursor.close()
-            return "OFF"
-    
-    except Error as e:
-        logger.error(f"❌ Error calculating status: {e}")
-        cursor.close()
-        return "OFF"
+        <div id="message" class="message"></div>
+    </div>
 
-# ========== ENDPOINTS ==========
+    <script>
+        document.getElementById('wifiForm').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const ssid = document.getElementById('ssid').value;
+            const password = document.getElementById('password').value;
+            const msg = document.getElementById('message');
+            
+            try {
+                const res = await fetch('/save-wifi', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ ssid, password })
+                });
+                
+                const data = await res.json();
+                msg.classList.add('show');
+                
+                if (data.status === 'success') {
+                    msg.className = 'message show success';
+                    msg.textContent = '✅ WiFi tersimpan! ESP32 restart...';
+                    document.getElementById('wifiForm').disabled = true;
+                } else {
+                    msg.className = 'message show error';
+                    msg.textContent = '❌ ' + (data.message || 'Gagal menyimpan');
+                }
+            } catch (error) {
+                msg.className = 'message show error';
+                msg.textContent = '❌ Error: ' + error.message;
+            }
+        });
+    </script>
+</body>
+</html>
+  )";
+  
+  configServer.send(200, "text/html", html);
+}
 
-@app.on_event("startup")
-async def startup():
-    logger.info("🚀 Starting Smart Irrigation API...")
-    migrate_db()
+void handleSaveWiFi() {
+  if (!configServer.hasArg("plain")) {
+    configServer.send(400, "application/json", "{\"status\":\"error\",\"message\":\"No data\"}");
+    return;
+  }
 
-@app.get("/")
-async def root():
-    return {
-        "status": "online",
-        "version": "6.0",
-        "timestamp": get_local_time().isoformat()
+  StaticJsonDocument<200> doc;
+  if (deserializeJson(doc, configServer.arg("plain")) != DeserializationError::Ok) {
+    configServer.send(400, "application/json", "{\"status\":\"error\",\"message\":\"JSON error\"}");
+    return;
+  }
+
+  String ssid = doc["ssid"];
+  String password = doc["password"];
+
+  if (ssid.length() == 0 || password.length() == 0) {
+    configServer.send(400, "application/json", "{\"status\":\"error\",\"message\":\"SSID atau password kosong\"}");
+    return;
+  }
+
+  saveWiFiConfig(ssid, password);
+  configServer.send(200, "application/json", "{\"status\":\"success\"}");
+  
+  Serial.println("🔄 Restarting ESP32...");
+  delay(2000);
+  ESP.restart();
+}
+
+void handleGetStatus() {
+  StaticJsonDocument<200> doc;
+  doc["mode"] = isConfigMode ? "config" : "normal";
+  doc["wifi_connected"] = isWiFiConnected;
+  doc["ssid"] = wifiSSID;
+  
+  String response;
+  serializeJson(doc, response);
+  configServer.send(200, "application/json", response);
+}
+
+void handleResetWiFi() {
+  SPIFFS.remove(CONFIG_FILE);
+  configServer.send(200, "application/json", "{\"status\":\"success\"}");
+  Serial.println("🔄 WiFi reset, restarting...");
+  delay(1000);
+  ESP.restart();
+}
+
+bool connectToWiFi() {
+  if (wifiSSID.length() == 0) {
+    Serial.println("⚠️ No WiFi config");
+    return false;
+  }
+
+  Serial.print("📡 Connecting to: " + wifiSSID + "... ");
+  
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(wifiSSID.c_str(), wifiPassword.c_str());
+  
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 30) {
+    delay(500);
+    Serial.print(".");
+    attempts++;
+  }
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\n✅ WiFi Connected!");
+    Serial.print("🌐 IP: ");
+    Serial.println(WiFi.localIP());
+    isWiFiConnected = true;
+    return true;
+  } else {
+    Serial.println("\n❌ WiFi Failed!");
+    isWiFiConnected = false;
+    return false;
+  }
+}
+
+void updateSensorData() {
+  if (!isWiFiConnected) return;
+
+  int soilRaw = analogRead(PIN_SOIL);
+  int waterRaw = analogRead(PIN_WATER);
+  
+  float soilPercent = map(soilRaw, 4095, 0, 0, 100);
+  float waterPercent = map(waterRaw, 4095, 0, 0, 100);
+  
+  Serial.print("🌱 Soil: ");
+  Serial.print(soilPercent);
+  Serial.print("% | 💧 Water: ");
+  Serial.print(waterPercent);
+  Serial.println("%");
+
+  HTTPClient http;
+  String fullUrl = apiBaseUrl + "/api/sensor/save";
+  http.begin(client, fullUrl.c_str());
+  http.addHeader("Content-Type", "application/json");
+  http.setConnectTimeout(5000);
+  
+  StaticJsonDocument<200> doc;
+  doc["moisture_level"] = soilPercent;
+  doc["water_level"] = waterPercent;
+  
+  String jsonBody;
+  serializeJson(doc, jsonBody);
+  
+  int httpCode = http.POST(jsonBody);
+  
+  if (httpCode == 200) {
+    String response = http.getString();
+    StaticJsonDocument<200> respDoc;
+    if (deserializeJson(respDoc, response) == DeserializationError::Ok) {
+      String command = respDoc["command"];
+      
+      if (command == "ON") {
+        digitalWrite(PIN_RELAY, POMPA_ON);
+        pumpStatus = "ON";
+      } else {
+        digitalWrite(PIN_RELAY, POMPA_OFF);
+        pumpStatus = "OFF";
+      }
     }
+  }
+  
+  http.end();
+}
 
-@app.get("/health")
-async def health():
-    db = get_db()
-    if db:
-        db.close()
-        return {
-            "status": "healthy",
-            "database": "connected",
-            "server_time": get_local_time().isoformat(),
-            "timezone": f"UTC+{TIMEZONE_OFFSET}"
+void checkControlStatus() {
+  if (!isWiFiConnected) return;
+
+  HTTPClient http;
+  String fullUrl = apiBaseUrl + "/api/control/status";
+  http.begin(client, fullUrl.c_str());
+  http.setConnectTimeout(5000);
+  
+  int httpCode = http.GET();
+  
+  if (httpCode == 200) {
+    String response = http.getString();
+    StaticJsonDocument<300> doc;
+    if (deserializeJson(doc, response) == DeserializationError::Ok) {
+      if (doc["pause_end_time"].isNull() || String(doc["pause_end_time"]) == "null") {
+        if (isPaused) {
+          isPaused = false;
+          Serial.println("⏸️ Jeda selesai!");
         }
-    return {"status": "unhealthy", "database": "disconnected"}
+      } else {
+        isPaused = true;
+      }
+    }
+  }
+  
+  http.end();
+}
 
-@app.get("/api/sensor/latest")
-async def get_latest():
-    db = get_db()
-    if not db:
-        raise HTTPException(status_code=500, detail="DB offline")
+void updateLED() {
+  if (millis() - lastBlink >= BLINK_INTERVAL) {
+    lastBlink = millis();
+    ledState = !ledState;
     
-    try:
-        cursor = db.cursor(dictionary=True)
-        cursor.execute("""
-            SELECT moisture_level, water_level, pump_status, created_at 
-            FROM sensor_data ORDER BY created_at DESC LIMIT 1
-        """)
-        row = cursor.fetchone()
-        cursor.close()
-        
-        if row:
-            return {
-                "moisture_level": float(row['moisture_level']),
-                "water_level": float(row['water_level']),
-                "pump_status": row['pump_status'],
-                "created_at": row['created_at'].isoformat() if row['created_at'] else None
-            }
-        
-        return {
-            "moisture_level": 0.0,
-            "water_level": 0.0,
-            "pump_status": "OFF",
-            "created_at": None
-        }
-    except Error as e:
-        logger.error(f"❌ Get latest error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        db.close()
+    if (isConfigMode) {
+      digitalWrite(PIN_LED, ledState ? HIGH : LOW);  // Blink
+    } else if (isWiFiConnected) {
+      digitalWrite(PIN_LED, HIGH);  // Terang
+    } else {
+      digitalWrite(PIN_LED, LOW);  // Mati
+    }
+  }
+}
 
-@app.get("/api/sensor/history")
-async def get_history(limit: int = 100):
-    db = get_db()
-    if not db:
-        raise HTTPException(status_code=500, detail="DB offline")
-    
-    try:
-        cursor = db.cursor(dictionary=True)
-        cursor.execute("""
-            SELECT moisture_level, water_level, pump_status, created_at 
-            FROM sensor_data 
-            WHERE created_at >= DATE_SUB(NOW(), INTERVAL 24 HOUR)
-            ORDER BY created_at ASC LIMIT %s
-        """, (limit,))
-        rows = cursor.fetchall()
-        cursor.close()
-        
-        return [{
-            "moisture": float(h['moisture_level']),
-            "water": float(h['water_level']),
-            "pump_status": h['pump_status'],
-            "time": h['created_at'].strftime("%H:%M") if h['created_at'] else ""
-        } for h in rows]
-    except Error as e:
-        logger.error(f"❌ Get history error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        db.close()
+void setup() {
+  Serial.begin(115200);
+  delay(2000);
+  
+  Serial.println("\n\n🚀 Smart Irrigation v8");
+  Serial.println("========================");
+  
+  pinMode(PIN_RELAY, OUTPUT);
+  digitalWrite(PIN_RELAY, POMPA_OFF);
+  
+  pinMode(PIN_LED, OUTPUT);
+  digitalWrite(PIN_LED, LOW);
+  
+  client.setInsecure();
+  
+  initSPIFFS();
+  loadWiFiConfig();
+  
+  if (!connectToWiFi()) {
+    startConfigMode();
+  }
+  
+  if (!rtc.begin()) {
+    Serial.println("⚠️ RTC not found");
+  } else {
+    Serial.println("✅ RTC OK");
+  }
+  
+  Serial.println("✅ Ready!");
+  Serial.println("========================\n");
+}
 
-@app.post("/api/sensor/save")
-async def save_sensor(data: SensorData):
-    db = get_db()
-    if not db:
-        raise HTTPException(status_code=500, detail="DB offline")
-    
-    try:
-        now = get_local_time()
-        
-        logger.info(f"\n📨 SENSOR DATA RECEIVED")
-        logger.info(f"   Moisture: {data.moisture_level}%")
-        logger.info(f"   Water: {data.water_level}%")
-        
-        pump_status = calculate_pump_status(db, now)
-        
-        cursor = db.cursor()
-        cursor.execute("""
-            INSERT INTO sensor_data (moisture_level, water_level, pump_status)
-            VALUES (%s, %s, %s)
-        """, (data.moisture_level, data.water_level, pump_status))
-        cursor.close()
-        
-        logger.info(f"💾 Saved to DB: pump_status = {pump_status}")
-        logger.info(f"{'='*60}\n")
-        
-        return {
-            "status": "success",
-            "command": pump_status,
-            "timestamp": now.isoformat()
-        }
-    except Error as e:
-        logger.error(f"❌ Save sensor error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        db.close()
+void loop() {
+  updateLED();
+  
+  if (isConfigMode) {
+    configServer.handleClient();
+    return;
+  }
 
-@app.post("/api/control/update")
-async def update_control(update: ControlUpdate):
-    db = get_db()
-    if not db:
-        raise HTTPException(status_code=500, detail="DB offline")
-    
-    try:
-        action = update.action.upper()
-        now = get_local_time()
-        
-        logger.info(f"\n{'='*60}")
-        logger.info(f"🎮 CONTROL UPDATE: {action}")
-        logger.info(f"{'='*60}")
-        
-        cursor = db.cursor()
-        
-        if action == "PAUSE":
-            minutes = update.minutes or 30
-            pause_until = now + timedelta(minutes=minutes)
-            
-            logger.info(f"⏸️  Pausing for {minutes} minutes")
-            logger.info(f"   Until: {pause_until.strftime('%Y-%m-%d %H:%M:%S')}")
-            
-            cursor.execute("""
-                UPDATE pump_control 
-                SET manual_mode = 'AUTO', pause_end_time = %s 
-                WHERE id = 1
-            """, (pause_until,))
-            
-            result_msg = f"Pause set for {minutes} minutes"
-        
-        elif action == "MANUAL_ON":
-            logger.info(f"🔌 Setting MANUAL_ON")
-            cursor.execute("""
-                UPDATE pump_control 
-                SET manual_mode = 'MANUAL_ON', pause_end_time = NULL 
-                WHERE id = 1
-            """)
-            result_msg = "Manual ON"
-        
-        elif action == "MANUAL_OFF":
-            logger.info(f"🔌 Setting MANUAL_OFF")
-            cursor.execute("""
-                UPDATE pump_control 
-                SET manual_mode = 'MANUAL_OFF', pause_end_time = NULL 
-                WHERE id = 1
-            """)
-            result_msg = "Manual OFF"
-        
-        elif action == "AUTO":
-            logger.info(f"📅 Setting AUTO mode")
-            cursor.execute("""
-                UPDATE pump_control 
-                SET manual_mode = 'AUTO', pause_end_time = NULL 
-                WHERE id = 1
-            """)
-            result_msg = "Auto mode"
-        
-        else:
-            cursor.close()
-            raise HTTPException(status_code=400, detail="Invalid action")
-        
-        cursor.close()
-        
-        logger.info(f"✅ {result_msg}")
-        logger.info(f"{'='*60}\n")
-        
-        return {
-            "status": "success",
-            "action": action,
-            "message": result_msg,
-            "timestamp": now.isoformat()
-        }
-    
-    except Error as e:
-        logger.error(f"❌ Update control error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        db.close()
-
-@app.post("/api/schedule/add")
-async def add_schedule(data: ScheduleData):
-    db = get_db()
-    if not db:
-        raise HTTPException(status_code=500, detail="DB offline")
-    
-    try:
-        logger.info(f"\n{'='*60}")
-        logger.info(f"📅 SCHEDULE UPDATE")
-        logger.info(f"   ON: {data.on_time}")
-        logger.info(f"   OFF: {data.off_time}")
-        
-        cursor = db.cursor()
-        
-        cursor.execute("DELETE FROM pump_schedules")
-        
-        cursor.execute("""
-            INSERT INTO pump_schedules (on_time, off_time, is_active)
-            VALUES (%s, %s, TRUE)
-        """, (data.on_time, data.off_time))
-        
-        cursor.close()
-        
-        logger.info(f"✅ Schedule saved")
-        logger.info(f"{'='*60}\n")
-        
-        return {
-            "status": "success",
-            "on_time": data.on_time,
-            "off_time": data.off_time
-        }
-    
-    except Error as e:
-        logger.error(f"❌ Add schedule error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        db.close()
-
-@app.get("/api/schedule/list")
-async def get_schedule():
-    db = get_db()
-    if not db:
-        raise HTTPException(status_code=500, detail="DB offline")
-    
-    try:
-        cursor = db.cursor(dictionary=True)
-        cursor.execute("""
-            SELECT on_time, off_time, is_active 
-            FROM pump_schedules WHERE is_active = TRUE LIMIT 1
-        """)
-        row = cursor.fetchone()
-        cursor.close()
-        
-        if row:
-            on_time = row['on_time']
-            off_time = row['off_time']
-            
-            if hasattr(on_time, 'strftime'):
-                on_time = on_time.strftime('%H:%M:%S')
-            if hasattr(off_time, 'strftime'):
-                off_time = off_time.strftime('%H:%M:%S')
-            
-            return {
-                "on_time": on_time,
-                "off_time": off_time,
-                "is_active": True
-            }
-        
-        return {
-            "on_time": None,
-            "off_time": None,
-            "is_active": False
-        }
-    except Error as e:
-        logger.error(f"❌ Get schedule error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        db.close()
-
-@app.get("/api/control/status")
-async def get_control_status():
-    db = get_db()
-    if not db:
-        raise HTTPException(status_code=500, detail="DB offline")
-    
-    try:
-        now = get_local_time()
-        
-        cursor = db.cursor(dictionary=True)
-        cursor.execute("SELECT * FROM pump_control WHERE id = 1")
-        control = cursor.fetchone()
-        
-        if not control:
-            calculated_status = "OFF"
-            manual_mode = "AUTO"
-            pause_end_time = None
-        else:
-            calculated_status = calculate_pump_status(db, now)
-            manual_mode = control.get('manual_mode', 'AUTO')
-            pause_end_time = control.get('pause_end_time')
-        
-        cursor.close()
-        
-        return {
-            "manual_mode": manual_mode,
-            "pause_end_time": pause_end_time.isoformat() if pause_end_time else None,
-            "calculated_pump_status": calculated_status,
-            "server_time": now.isoformat()
-        }
-    except Error as e:
-        logger.error(f"❌ Get control status error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        db.close()
+  if (millis() - lastSensorUpdate >= SENSOR_INTERVAL) {
+    updateSensorData();
+    lastSensorUpdate = millis();
+  }
+  
+  if (millis() - lastStatusCheck >= STATUS_INTERVAL) {
+    checkControlStatus();
+    lastStatusCheck = millis();
+  }
+}
