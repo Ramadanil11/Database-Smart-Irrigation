@@ -11,7 +11,7 @@ import logging
 
 load_dotenv()
 
-app = FastAPI(title="Smart Irrigation API v7")
+app = FastAPI(title="Smart Irrigation API v8")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -137,7 +137,7 @@ def is_in_schedule(now_dt: datetime, on_str: str, off_str: str) -> bool:
         return False
 
 def calculate_pump_status(db, now_dt: datetime) -> str:
-    """FIXED: Proper pump status calculation"""
+    """FIXED: Proper pump status calculation with auto-clear logic"""
     try:
         cursor = db.cursor(dictionary=True)
         
@@ -148,10 +148,9 @@ def calculate_pump_status(db, now_dt: datetime) -> str:
             cursor.close()
             return "OFF"
         
-        # PRIORITY 1: Check PAUSE
+        # PRIORITY 1: Check PAUSE - harus di cek dan di-clear jika expired
         pause_end_time = control.get('pause_end_time')
         if pause_end_time:
-            # Convert to datetime if needed
             if isinstance(pause_end_time, str):
                 pause_dt = datetime.fromisoformat(pause_end_time)
             else:
@@ -163,24 +162,31 @@ def calculate_pump_status(db, now_dt: datetime) -> str:
                 cursor.close()
                 return "OFF"
             else:
-                # Pause expired - clear it
-                logger.info(f"✅ Pause expired, clearing")
-                cursor.execute("UPDATE pump_control SET pause_end_time = NULL WHERE id = 1")
-                # Continue to next priority
+                # FIX: Pause sudah selesai - clear pause DAN reset ke AUTO mode
+                logger.info(f"✅ Pause expired, resetting to AUTO mode")
+                cursor.execute("""
+                    UPDATE pump_control 
+                    SET pause_end_time = NULL, manual_mode = 'AUTO' 
+                    WHERE id = 1
+                """)
+                # Refresh control data setelah update
+                cursor.execute("SELECT * FROM pump_control WHERE id = 1")
+                control = cursor.fetchone()
         
         # PRIORITY 2: Check MANUAL mode
         manual_mode = control.get('manual_mode', 'AUTO')
         
         if manual_mode == 'MANUAL_ON':
-            logger.info(f"🔌 MANUAL_ON")
+            logger.info(f"🔌 MANUAL_ON active")
             cursor.close()
             return "ON"
         elif manual_mode == 'MANUAL_OFF':
-            logger.info(f"🔌 MANUAL_OFF")
+            logger.info(f"🔌 MANUAL_OFF active")
             cursor.close()
             return "OFF"
         
         # PRIORITY 3: Check SCHEDULE (AUTO mode)
+        # Kita sampai sini berarti manual_mode = 'AUTO'
         cursor.execute("""
             SELECT on_time, off_time FROM pump_schedules 
             WHERE is_active = TRUE ORDER BY id DESC LIMIT 1
@@ -196,7 +202,7 @@ def calculate_pump_status(db, now_dt: datetime) -> str:
             if hasattr(off_time, 'strftime'):
                 off_time = off_time.strftime('%H:%M:%S')
             
-            logger.info(f"📅 Checking schedule: {on_time} - {off_time}")
+            logger.info(f"📅 Checking schedule: {on_time} - {off_time} (mode: {manual_mode})")
             
             if is_in_schedule(now_dt, on_time, off_time):
                 logger.info(f"✅ Within schedule → ON")
@@ -207,13 +213,14 @@ def calculate_pump_status(db, now_dt: datetime) -> str:
                 cursor.close()
                 return "OFF"
         
-        logger.info(f"📅 No schedule found → OFF")
+        logger.info(f"📅 No active schedule found → OFF")
         cursor.close()
         return "OFF"
     
     except Exception as e:
-        logger.error(f"❌ Error: {e}")
-        cursor.close()
+        logger.error(f"❌ Error in calculate_pump_status: {e}")
+        if 'cursor' in locals():
+            cursor.close()
         return "OFF"
 
 @app.on_event("startup")
@@ -222,7 +229,7 @@ async def startup():
 
 @app.get("/")
 async def root():
-    return {"status": "online", "version": "7.0"}
+    return {"status": "online", "version": "8.0"}
 
 @app.get("/health")
 async def health():
@@ -320,48 +327,52 @@ async def update_control(update: ControlUpdate):
         action = update.action.upper()
         now = get_local_time()
         
-        logger.info(f"🎮 CONTROL: {action}")
+        logger.info(f"🎮 CONTROL ACTION: {action}")
         cursor = db.cursor()
         
         if action == "PAUSE":
             minutes = update.minutes or 30
             pause_until = now + timedelta(minutes=minutes)
             
+            # FIX: Saat PAUSE, set manual_mode ke AUTO agar setelah pause selesai langsung cek schedule
             cursor.execute("""
                 UPDATE pump_control 
                 SET manual_mode = 'AUTO', pause_end_time = %s 
                 WHERE id = 1
             """, (pause_until,))
             
-            logger.info(f"⏸️ Pause for {minutes} minutes until {pause_until}")
+            logger.info(f"⏸️ Pause for {minutes} minutes until {pause_until}, mode set to AUTO")
             msg = f"Pause set for {minutes} minutes"
         
         elif action == "MANUAL_ON":
+            # FIX: Clear pause saat manual control
             cursor.execute("""
                 UPDATE pump_control 
                 SET manual_mode = 'MANUAL_ON', pause_end_time = NULL 
                 WHERE id = 1
             """)
-            logger.info(f"🔌 MANUAL_ON")
-            msg = "Manual ON"
+            logger.info(f"🔌 MANUAL_ON activated, pause cleared")
+            msg = "Manual ON activated"
         
         elif action == "MANUAL_OFF":
+            # FIX: Clear pause saat manual control
             cursor.execute("""
                 UPDATE pump_control 
                 SET manual_mode = 'MANUAL_OFF', pause_end_time = NULL 
                 WHERE id = 1
             """)
-            logger.info(f"🔌 MANUAL_OFF")
-            msg = "Manual OFF"
+            logger.info(f"🔌 MANUAL_OFF activated, pause cleared")
+            msg = "Manual OFF activated"
         
         elif action == "AUTO":
+            # FIX: Clear pause dan kembalikan ke AUTO
             cursor.execute("""
                 UPDATE pump_control 
                 SET manual_mode = 'AUTO', pause_end_time = NULL 
                 WHERE id = 1
             """)
-            logger.info(f"📅 AUTO mode")
-            msg = "Auto mode"
+            logger.info(f"📅 AUTO mode activated, pause cleared")
+            msg = "Auto mode activated"
         
         else:
             cursor.close()
@@ -369,10 +380,15 @@ async def update_control(update: ControlUpdate):
         
         cursor.close()
         
+        # FIX: Immediately calculate new pump status after control update
+        new_status = calculate_pump_status(db, now)
+        logger.info(f"📊 New pump status after control: {new_status}")
+        
         return {
             "status": "success",
             "action": action,
-            "message": msg
+            "message": msg,
+            "pump_status": new_status
         }
     except Error as e:
         logger.error(f"❌ Control error: {e}")
@@ -387,22 +403,33 @@ async def add_schedule(data: ScheduleData):
         raise HTTPException(status_code=500, detail="DB offline")
     
     try:
-        logger.info(f"📅 Schedule: {data.on_time} - {data.off_time}")
+        logger.info(f"📅 Adding schedule: {data.on_time} - {data.off_time}")
         cursor = db.cursor()
         
-        cursor.execute("DELETE FROM pump_schedules")
+        # Clear existing schedules
+        cursor.execute("UPDATE pump_schedules SET is_active = FALSE")
+        
+        # Add new schedule
         cursor.execute("""
             INSERT INTO pump_schedules (on_time, off_time, is_active)
             VALUES (%s, %s, TRUE)
         """, (data.on_time, data.off_time))
         
+        # FIX: Saat schedule ditambahkan, reset ke AUTO mode (clear manual override)
+        cursor.execute("""
+            UPDATE pump_control 
+            SET manual_mode = 'AUTO', pause_end_time = NULL 
+            WHERE id = 1
+        """)
+        
         cursor.close()
-        logger.info(f"✅ Schedule saved")
+        logger.info(f"✅ Schedule saved and system reset to AUTO mode")
         
         return {
             "status": "success",
             "on_time": data.on_time,
-            "off_time": data.off_time
+            "off_time": data.off_time,
+            "message": "Schedule saved, system in AUTO mode"
         }
     except Error as e:
         logger.error(f"❌ Schedule error: {e}")
@@ -420,7 +447,7 @@ async def get_schedule():
         cursor = db.cursor(dictionary=True)
         cursor.execute("""
             SELECT on_time, off_time FROM pump_schedules 
-            WHERE is_active = TRUE LIMIT 1
+            WHERE is_active = TRUE ORDER BY id DESC LIMIT 1
         """)
         row = cursor.fetchone()
         cursor.close()
@@ -460,19 +487,21 @@ async def get_control_status():
         cursor.execute("SELECT * FROM pump_control WHERE id = 1")
         control = cursor.fetchone()
         
-        if not control:
-            calculated_status = "OFF"
-        else:
-            calculated_status = calculate_pump_status(db, now)
+        calculated_status = calculate_pump_status(db, now)
         
         cursor.close()
         
         pause_end_time = None
-        if control and control.get('pause_end_time'):
-            pause_end_time = control['pause_end_time'].isoformat() if hasattr(control['pause_end_time'], 'isoformat') else str(control['pause_end_time'])
+        manual_mode = "AUTO"
+        
+        if control:
+            if control.get('pause_end_time'):
+                pause_end_time = control['pause_end_time'].isoformat() if hasattr(control['pause_end_time'], 'isoformat') else str(control['pause_end_time'])
+            manual_mode = control.get('manual_mode', 'AUTO')
         
         return {
             "calculated_pump_status": calculated_status,
+            "manual_mode": manual_mode,
             "pause_end_time": pause_end_time,
             "server_time": now.isoformat()
         }
