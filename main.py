@@ -194,7 +194,15 @@ def calculate_pump_status(db, now_dt: datetime) -> str:
             logger.info(f"   Pause until: {pause_end_time}")
             logger.info(f"   Now: {now_dt}")
             
-            if now_dt < pause_end_time:
+            # Convert pause_end_time to datetime if it's a time object
+            if hasattr(pause_end_time, 'replace'):
+                # It's a datetime object
+                pause_dt = pause_end_time
+            else:
+                # Convert string to datetime
+                pause_dt = datetime.fromisoformat(str(pause_end_time))
+            
+            if now_dt < pause_dt:
                 logger.info(f"   ✓ PAUSE ACTIVE → Return OFF")
                 cursor.close()
                 return "OFF"
