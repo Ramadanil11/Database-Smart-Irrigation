@@ -555,18 +555,19 @@ async def get_schedule():
 @app.delete("/api/schedule/delete")
 async def delete_schedule():
     """
-    Delete the active schedule and reset system to AUTO mode
+    Delete ALL schedules from database and reset system to AUTO mode
     """
     db = get_db()
     if not db:
         raise HTTPException(status_code=500, detail="DB offline")
     
     try:
-        logger.info(f"🗑️ Deleting active schedule")
+        logger.info(f"🗑️ Deleting ALL schedules from database")
         cursor = db.cursor()
         
-        # Deactivate all schedules
-        cursor.execute("UPDATE pump_schedules SET is_active = FALSE")
+        # DELETE all schedules (completely remove from database)
+        cursor.execute("DELETE FROM pump_schedules")
+        deleted_count = cursor.rowcount
         
         # Reset pump control to AUTO mode with no pause
         cursor.execute("""
@@ -576,11 +577,12 @@ async def delete_schedule():
         """)
         
         cursor.close()
-        logger.info(f"✅ Schedule deleted, system reset to AUTO mode (no active schedule)")
+        logger.info(f"✅ {deleted_count} schedule(s) permanently deleted, system reset to AUTO mode")
         
         return {
             "status": "success",
-            "message": "Schedule deleted successfully",
+            "message": f"{deleted_count} schedule(s) deleted successfully",
+            "deleted_count": deleted_count,
             "mode": "AUTO"
         }
     except Error as e:
