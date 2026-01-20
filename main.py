@@ -12,7 +12,7 @@ import asyncio
 
 load_dotenv()
 
-app = FastAPI(title="Smart Irrigation API v8.4-FIXED")
+app = FastAPI(title="Smart Irrigation API v9.0-FINAL-FIX")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -66,6 +66,11 @@ def get_db():
                 return None
 
 def migrate_db():
+    """
+    FIX: Update database schema sesuai dengan struktur yang benar
+    - Column: manual_target (ON/OFF/AUTO)
+    - pause_until column untuk menyimpan waktu pause
+    """
     db = get_db()
     if not db:
         return
@@ -73,10 +78,12 @@ def migrate_db():
     try:
         cursor = db.cursor()
         
+        # FIX: Struktur yang benar sesuai screenshot
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS pump_control (
                 id INT PRIMARY KEY DEFAULT 1,
-                manual_mode VARCHAR(20) DEFAULT 'AUTO',
+                manual_target VARCHAR(20) DEFAULT 'AUTO',
+                pause_until DATETIME NULL,
                 pause_end_time DATETIME NULL,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
@@ -106,7 +113,7 @@ def migrate_db():
         cursor.execute("SELECT COUNT(*) FROM pump_control WHERE id = 1")
         if cursor.fetchone()[0] == 0:
             cursor.execute("""
-                INSERT INTO pump_control (id, manual_mode, pause_end_time)
+                INSERT INTO pump_control (id, manual_target, pause_end_time)
                 VALUES (1, 'AUTO', NULL)
             """)
         
@@ -141,9 +148,10 @@ def is_in_schedule(now_dt: datetime, on_str: str, off_str: str) -> bool:
 
 def calculate_pump_status(db, now_dt: datetime) -> str:
     """
-    FIXED: Proper pump status calculation
-    - Saat pause selesai, sistem kembali ke AUTO mode TANPA otomatis ON
-    - Hanya ON jika ada schedule aktif yang match waktu saat ini
+    FIXED: Logic yang benar sesuai struktur database
+    - Gunakan manual_target (ON/OFF/AUTO)
+    - Saat pause selesai, TIDAK reset ke AUTO
+    - Priority: PAUSE > MANUAL (ON/OFF) > SCHEDULE (AUTO)
     """
     try:
         cursor = db.cursor(dictionary=True)
@@ -164,65 +172,67 @@ def calculate_pump_status(db, now_dt: datetime) -> str:
                 pause_dt = pause_end_time
             
             if now_dt < pause_dt:
-                # Pause masih aktif
-                logger.info(f"⏸️ Pause active until {pause_dt}")
+                # Pause masih aktif - pompa HARUS OFF
+                logger.info(f"⏸️ Pause active until {pause_dt} → FORCE OFF")
                 cursor.close()
                 return "OFF"
             else:
-                # FIX: Pause sudah selesai - clear pause DAN reset ke AUTO mode
-                # TAPI JANGAN langsung ON, harus cek schedule dulu
+                # FIX: Pause sudah selesai - clear pause TANPA mengubah manual_target
                 logger.info(f"✅ Pause expired at {pause_dt}, clearing pause...")
                 cursor.execute("""
                     UPDATE pump_control 
-                    SET pause_end_time = NULL, manual_mode = 'AUTO' 
+                    SET pause_end_time = NULL 
                     WHERE id = 1
                 """)
                 
-                # Refresh control data setelah update
+                # Refresh control data
                 cursor.execute("SELECT * FROM pump_control WHERE id = 1")
                 control = cursor.fetchone()
         
-        # PRIORITY 2: Check MANUAL mode
-        manual_mode = control.get('manual_mode', 'AUTO')
+        # PRIORITY 2: Check MANUAL_TARGET
+        manual_target = control.get('manual_target', 'AUTO')
         
-        if manual_mode == 'MANUAL_ON':
-            logger.info(f"🔌 MANUAL_ON active")
+        if manual_target == 'ON':
+            logger.info(f"🔌 MANUAL ON active")
             cursor.close()
             return "ON"
-        elif manual_mode == 'MANUAL_OFF':
-            logger.info(f"🔌 MANUAL_OFF active")
+        elif manual_target == 'OFF':
+            logger.info(f"🔌 MANUAL OFF active")
             cursor.close()
             return "OFF"
         
         # PRIORITY 3: Check SCHEDULE (AUTO mode)
-        cursor.execute("""
-            SELECT on_time, off_time FROM pump_schedules 
-            WHERE is_active = TRUE ORDER BY id DESC LIMIT 1
-        """)
-        schedule = cursor.fetchone()
+        if manual_target == 'AUTO':
+            cursor.execute("""
+                SELECT on_time, off_time FROM pump_schedules 
+                WHERE is_active = TRUE ORDER BY id DESC LIMIT 1
+            """)
+            schedule = cursor.fetchone()
+            
+            if schedule:
+                on_time = schedule['on_time']
+                off_time = schedule['off_time']
+                
+                if hasattr(on_time, 'strftime'):
+                    on_time = on_time.strftime('%H:%M:%S')
+                if hasattr(off_time, 'strftime'):
+                    off_time = off_time.strftime('%H:%M:%S')
+                
+                logger.info(f"📅 Schedule check: {on_time} - {off_time}")
+                
+                if is_in_schedule(now_dt, on_time, off_time):
+                    logger.info(f"✅ Within schedule → ON")
+                    cursor.close()
+                    return "ON"
+                else:
+                    logger.info(f"❌ Outside schedule → OFF")
+                    cursor.close()
+                    return "OFF"
+            
+            logger.info(f"📅 No schedule → OFF")
+            cursor.close()
+            return "OFF"
         
-        if schedule:
-            on_time = schedule['on_time']
-            off_time = schedule['off_time']
-            
-            if hasattr(on_time, 'strftime'):
-                on_time = on_time.strftime('%H:%M:%S')
-            if hasattr(off_time, 'strftime'):
-                off_time = off_time.strftime('%H:%M:%S')
-            
-            logger.info(f"📅 Checking schedule: {on_time} - {off_time} (mode: {manual_mode})")
-            
-            if is_in_schedule(now_dt, on_time, off_time):
-                logger.info(f"✅ Within schedule → ON")
-                cursor.close()
-                return "ON"
-            else:
-                logger.info(f"❌ Outside schedule → OFF")
-                cursor.close()
-                return "OFF"
-        
-        # FIX: Tidak ada schedule aktif = OFF (bukan ON)
-        logger.info(f"📅 No active schedule → OFF")
         cursor.close()
         return "OFF"
     
@@ -246,7 +256,7 @@ async def auto_check_pause_expiry():
                 now = get_local_time()
                 cursor = db.cursor(dictionary=True)
                 
-                cursor.execute("SELECT pause_end_time, manual_mode FROM pump_control WHERE id = 1")
+                cursor.execute("SELECT pause_end_time, manual_target FROM pump_control WHERE id = 1")
                 control = cursor.fetchone()
                 
                 if control and control.get('pause_end_time'):
@@ -260,10 +270,8 @@ async def auto_check_pause_expiry():
                     if now >= pause_dt:
                         logger.info(f"🔄 Auto-check: Pause expired, updating status")
                         
-                        # FIX: Hitung status dengan benar (tidak otomatis ON)
                         new_status = calculate_pump_status(db, now)
                         
-                        # Insert sensor data dengan status yang benar
                         cursor.execute("""
                             INSERT INTO sensor_data (moisture_level, water_level, pump_status)
                             SELECT 
@@ -272,7 +280,7 @@ async def auto_check_pause_expiry():
                                 %s
                         """, (new_status,))
                         
-                        logger.info(f"✅ Auto-check: Pause cleared, pump status = {new_status}")
+                        logger.info(f"✅ Pause cleared, pump status = {new_status}")
                 
                 cursor.close()
             finally:
@@ -285,14 +293,14 @@ async def auto_check_pause_expiry():
 async def startup():
     migrate_db()
     asyncio.create_task(auto_check_pause_expiry())
-    logger.info("✅ Auto-check pause expiry task started")
+    logger.info("✅ System started - v9.0-FINAL-FIX")
 
 @app.get("/")
 async def root():
     return {
         "status": "online", 
-        "version": "8.4-FIXED", 
-        "fixes": ["sensor_data_update", "pause_auto_on_bug"]
+        "version": "9.0-FINAL-FIX", 
+        "fixes": ["correct_db_structure", "manual_target_ON_OFF_AUTO", "pause_logic", "1_day_chart"]
     }
 
 @app.get("/health")
@@ -335,7 +343,9 @@ async def get_latest():
 
 @app.get("/api/sensor/history")
 async def get_history(limit: int = 1000):
-    """Get sensor history for the last 2 days"""
+    """
+    FIX: Get sensor history for the last 1 DAY (bukan 2 hari)
+    """
     db = get_db()
     if not db:
         raise HTTPException(status_code=500, detail="DB offline")
@@ -343,10 +353,7 @@ async def get_history(limit: int = 1000):
     try:
         cursor = db.cursor(dictionary=True)
         
-        cursor.execute("SELECT COUNT(*) as total FROM sensor_data")
-        total = cursor.fetchone()['total']
-        logger.info(f"📊 Total records in sensor_data: {total}")
-        
+        # FIX: 1 DAY instead of 2 DAYS
         cursor.execute("""
             SELECT 
                 moisture_level as moisture,
@@ -354,16 +361,13 @@ async def get_history(limit: int = 1000):
                 created_at,
                 pump_status
             FROM sensor_data 
-            WHERE created_at >= DATE_SUB(
-                (SELECT MAX(created_at) FROM sensor_data), 
-                INTERVAL 2 DAY
-            )
+            WHERE created_at >= DATE_SUB(NOW(), INTERVAL 1 DAY)
             ORDER BY created_at ASC
             LIMIT %s
         """, (limit,))
         
         rows = cursor.fetchall()
-        logger.info(f"📊 Query returned {len(rows)} rows from last 2 days")
+        logger.info(f"📊 Query returned {len(rows)} rows from last 1 day")
         
         cursor.close()
         
@@ -382,41 +386,31 @@ async def get_history(limit: int = 1000):
 
 @app.post("/api/sensor/save")
 async def save_sensor(data: SensorData):
-    """
-    FIX: Improved sensor data saving with better error handling
-    """
+    """Save sensor data with proper validation"""
     db = get_db()
     if not db:
-        logger.error("❌ Database connection failed in save_sensor")
+        logger.error("❌ Database connection failed")
         raise HTTPException(status_code=500, detail="DB offline")
     
     try:
         now = get_local_time()
         
-        # Hitung pump status
+        # Validate and clamp data
+        moisture = max(0, min(100, data.moisture_level))
+        water = max(0, min(100, data.water_level))
+        
         pump_status = calculate_pump_status(db, now)
-        
-        # Validate data
-        if data.moisture_level < 0 or data.moisture_level > 100:
-            logger.warning(f"⚠️ Invalid moisture_level: {data.moisture_level}")
-            data.moisture_level = max(0, min(100, data.moisture_level))
-        
-        if data.water_level < 0 or data.water_level > 100:
-            logger.warning(f"⚠️ Invalid water_level: {data.water_level}")
-            data.water_level = max(0, min(100, data.water_level))
         
         cursor = db.cursor()
         
-        # FIX: Explicit insert with error handling
         try:
             cursor.execute("""
                 INSERT INTO sensor_data (moisture_level, water_level, pump_status, created_at)
                 VALUES (%s, %s, %s, %s)
-            """, (data.moisture_level, data.water_level, pump_status, now))
+            """, (moisture, water, pump_status, now))
             
-            # Verify insert
             insert_id = cursor.lastrowid
-            logger.info(f"💾 Saved ID={insert_id}: moisture={data.moisture_level}%, water={data.water_level}%, pump={pump_status}")
+            logger.info(f"💾 ID={insert_id}: moisture={moisture}%, water={water}%, pump={pump_status}")
             
         except Error as insert_error:
             logger.error(f"❌ Insert error: {insert_error}")
@@ -431,8 +425,8 @@ async def save_sensor(data: SensorData):
             "command": pump_status,
             "timestamp": now.isoformat(),
             "data_saved": {
-                "moisture": data.moisture_level,
-                "water": data.water_level
+                "moisture": moisture,
+                "water": water
             }
         }
         
@@ -447,6 +441,10 @@ async def save_sensor(data: SensorData):
 
 @app.post("/api/control/update")
 async def update_control(update: ControlUpdate):
+    """
+    FIX: Gunakan manual_target dengan nilai ON/OFF/AUTO
+    Saat PAUSE, simpan state sebelumnya agar bisa kembali setelah pause selesai
+    """
     db = get_db()
     if not db:
         raise HTTPException(status_code=500, detail="DB offline")
@@ -456,47 +454,51 @@ async def update_control(update: ControlUpdate):
         now = get_local_time()
         
         logger.info(f"🎮 CONTROL ACTION: {action}")
-        cursor = db.cursor()
+        cursor = db.cursor(dictionary=True)
         
         if action == "PAUSE":
             minutes = update.minutes or 30
             pause_until = now + timedelta(minutes=minutes)
             
-            # FIX: Set ke AUTO mode saat pause (bukan MANUAL_OFF)
+            # FIX: Saat pause, JANGAN ubah manual_target
+            # Hanya set pause_end_time
             cursor.execute("""
                 UPDATE pump_control 
-                SET manual_mode = 'AUTO', pause_end_time = %s 
+                SET pause_end_time = %s 
                 WHERE id = 1
             """, (pause_until,))
             
-            logger.info(f"⏸️ Pause for {minutes} minutes until {pause_until}, mode=AUTO")
+            logger.info(f"⏸️ Pause for {minutes} minutes until {pause_until}")
             msg = f"Pause set for {minutes} minutes"
         
         elif action == "MANUAL_ON":
+            # FIX: Set manual_target = 'ON' dan clear pause
             cursor.execute("""
                 UPDATE pump_control 
-                SET manual_mode = 'MANUAL_ON', pause_end_time = NULL 
+                SET manual_target = 'ON', pause_end_time = NULL 
                 WHERE id = 1
             """)
-            logger.info(f"🔌 MANUAL_ON activated")
+            logger.info(f"🔌 manual_target = ON")
             msg = "Manual ON activated"
         
         elif action == "MANUAL_OFF":
+            # FIX: Set manual_target = 'OFF' dan clear pause
             cursor.execute("""
                 UPDATE pump_control 
-                SET manual_mode = 'MANUAL_OFF', pause_end_time = NULL 
+                SET manual_target = 'OFF', pause_end_time = NULL 
                 WHERE id = 1
             """)
-            logger.info(f"🔌 MANUAL_OFF activated")
+            logger.info(f"🔌 manual_target = OFF")
             msg = "Manual OFF activated"
         
         elif action == "AUTO":
+            # FIX: Set manual_target = 'AUTO' dan clear pause
             cursor.execute("""
                 UPDATE pump_control 
-                SET manual_mode = 'AUTO', pause_end_time = NULL 
+                SET manual_target = 'AUTO', pause_end_time = NULL 
                 WHERE id = 1
             """)
-            logger.info(f"📅 AUTO mode activated")
+            logger.info(f"📅 manual_target = AUTO")
             msg = "Auto mode activated"
         
         else:
@@ -537,14 +539,15 @@ async def add_schedule(data: ScheduleData):
             VALUES (%s, %s, TRUE)
         """, (data.on_time, data.off_time))
         
+        # FIX: Set ke AUTO mode dan clear pause
         cursor.execute("""
             UPDATE pump_control 
-            SET manual_mode = 'AUTO', pause_end_time = NULL 
+            SET manual_target = 'AUTO', pause_end_time = NULL 
             WHERE id = 1
         """)
         
         cursor.close()
-        logger.info(f"✅ Schedule saved and system reset to AUTO mode")
+        logger.info(f"✅ Schedule saved, manual_target = AUTO")
         
         return {
             "status": "success",
@@ -602,7 +605,7 @@ async def delete_schedule():
         raise HTTPException(status_code=500, detail="DB offline")
     
     try:
-        logger.info(f"🗑️ Deleting ALL schedules from database")
+        logger.info(f"🗑️ Deleting schedules")
         cursor = db.cursor()
         
         cursor.execute("DELETE FROM pump_schedules")
@@ -610,23 +613,23 @@ async def delete_schedule():
         
         cursor.execute("ALTER TABLE pump_schedules AUTO_INCREMENT = 1")
         
+        # FIX: Set ke AUTO dan clear pause
         cursor.execute("""
             UPDATE pump_control 
-            SET manual_mode = 'AUTO', pause_end_time = NULL 
+            SET manual_target = 'AUTO', pause_end_time = NULL 
             WHERE id = 1
         """)
         
         cursor.close()
-        logger.info(f"✅ {deleted_count} schedule(s) deleted, system reset to AUTO")
+        logger.info(f"✅ {deleted_count} schedule(s) deleted")
         
         return {
             "status": "success",
-            "message": f"{deleted_count} schedule(s) deleted successfully",
-            "deleted_count": deleted_count,
-            "mode": "AUTO"
+            "message": f"{deleted_count} schedule(s) deleted",
+            "deleted_count": deleted_count
         }
     except Error as e:
-        logger.error(f"❌ Delete schedule error: {e}")
+        logger.error(f"❌ Delete error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         db.close()
@@ -649,16 +652,16 @@ async def get_control_status():
         cursor.close()
         
         pause_end_time = None
-        manual_mode = "AUTO"
+        manual_target = "AUTO"
         
         if control:
             if control.get('pause_end_time'):
                 pause_end_time = control['pause_end_time'].isoformat() if hasattr(control['pause_end_time'], 'isoformat') else str(control['pause_end_time'])
-            manual_mode = control.get('manual_mode', 'AUTO')
+            manual_target = control.get('manual_target', 'AUTO')
         
         return {
             "calculated_pump_status": calculated_status,
-            "manual_mode": manual_mode,
+            "manual_target": manual_target,
             "pause_end_time": pause_end_time,
             "server_time": now.isoformat()
         }
