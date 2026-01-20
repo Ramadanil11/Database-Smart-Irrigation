@@ -12,7 +12,7 @@ import asyncio
 
 load_dotenv()
 
-app = FastAPI(title="Smart Irrigation API v8.3")
+app = FastAPI(title="Smart Irrigation API v8.4-FIXED")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -59,8 +59,10 @@ def get_db():
             )
             return db
         except Error as e:
-            logger.error(f"❌ DB Error: {e}")
-            if attempt == max_retries - 1:
+            logger.error(f"❌ DB Error (attempt {attempt+1}/{max_retries}): {e}")
+            if attempt < max_retries - 1:
+                asyncio.sleep(1)
+            else:
                 return None
 
 def migrate_db():
@@ -138,7 +140,11 @@ def is_in_schedule(now_dt: datetime, on_str: str, off_str: str) -> bool:
         return False
 
 def calculate_pump_status(db, now_dt: datetime) -> str:
-    """FIXED: Proper pump status calculation with auto-clear logic"""
+    """
+    FIXED: Proper pump status calculation
+    - Saat pause selesai, sistem kembali ke AUTO mode TANPA otomatis ON
+    - Hanya ON jika ada schedule aktif yang match waktu saat ini
+    """
     try:
         cursor = db.cursor(dictionary=True)
         
@@ -149,7 +155,7 @@ def calculate_pump_status(db, now_dt: datetime) -> str:
             cursor.close()
             return "OFF"
         
-        # PRIORITY 1: Check PAUSE - harus di cek dan di-clear jika expired
+        # PRIORITY 1: Check PAUSE
         pause_end_time = control.get('pause_end_time')
         if pause_end_time:
             if isinstance(pause_end_time, str):
@@ -164,7 +170,8 @@ def calculate_pump_status(db, now_dt: datetime) -> str:
                 return "OFF"
             else:
                 # FIX: Pause sudah selesai - clear pause DAN reset ke AUTO mode
-                logger.info(f"✅ Pause expired at {pause_dt}, resetting to AUTO mode")
+                # TAPI JANGAN langsung ON, harus cek schedule dulu
+                logger.info(f"✅ Pause expired at {pause_dt}, clearing pause...")
                 cursor.execute("""
                     UPDATE pump_control 
                     SET pause_end_time = NULL, manual_mode = 'AUTO' 
@@ -214,7 +221,8 @@ def calculate_pump_status(db, now_dt: datetime) -> str:
                 cursor.close()
                 return "OFF"
         
-        logger.info(f"📅 No active schedule found → OFF")
+        # FIX: Tidak ada schedule aktif = OFF (bukan ON)
+        logger.info(f"📅 No active schedule → OFF")
         cursor.close()
         return "OFF"
     
@@ -250,10 +258,12 @@ async def auto_check_pause_expiry():
                         pause_dt = pause_end_time
                     
                     if now >= pause_dt:
-                        logger.info(f"🔄 Auto-check: Pause expired, forcing status update")
+                        logger.info(f"🔄 Auto-check: Pause expired, updating status")
                         
+                        # FIX: Hitung status dengan benar (tidak otomatis ON)
                         new_status = calculate_pump_status(db, now)
                         
+                        # Insert sensor data dengan status yang benar
                         cursor.execute("""
                             INSERT INTO sensor_data (moisture_level, water_level, pump_status)
                             SELECT 
@@ -262,7 +272,7 @@ async def auto_check_pause_expiry():
                                 %s
                         """, (new_status,))
                         
-                        logger.info(f"✅ Auto-check: Pause cleared, pump status set to {new_status}")
+                        logger.info(f"✅ Auto-check: Pause cleared, pump status = {new_status}")
                 
                 cursor.close()
             finally:
@@ -279,7 +289,11 @@ async def startup():
 
 @app.get("/")
 async def root():
-    return {"status": "online", "version": "8.3", "features": ["auto_pause_check", "2_days_history", "delete_schedule"]}
+    return {
+        "status": "online", 
+        "version": "8.4-FIXED", 
+        "fixes": ["sensor_data_update", "pause_auto_on_bug"]
+    }
 
 @app.get("/health")
 async def health():
@@ -298,7 +312,8 @@ async def get_latest():
     try:
         cursor = db.cursor(dictionary=True)
         cursor.execute("""
-            SELECT moisture_level, water_level, pump_status FROM sensor_data 
+            SELECT moisture_level, water_level, pump_status, created_at 
+            FROM sensor_data 
             ORDER BY created_at DESC LIMIT 1
         """)
         row = cursor.fetchone()
@@ -308,18 +323,19 @@ async def get_latest():
             return {
                 "moisture_level": float(row['moisture_level']),
                 "water_level": float(row['water_level']),
-                "pump_status": row['pump_status']
+                "pump_status": row['pump_status'],
+                "last_update": row['created_at'].isoformat() if row['created_at'] else None
             }
-        return {"moisture_level": 0.0, "water_level": 0.0, "pump_status": "OFF"}
+        return {"moisture_level": 0.0, "water_level": 0.0, "pump_status": "OFF", "last_update": None}
+    except Error as e:
+        logger.error(f"❌ Get latest error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
     finally:
         db.close()
 
 @app.get("/api/sensor/history")
 async def get_history(limit: int = 1000):
-    """
-    Get sensor history for the last 2 days
-    Returns data ordered from oldest to newest for chart display
-    """
+    """Get sensor history for the last 2 days"""
     db = get_db()
     if not db:
         raise HTTPException(status_code=500, detail="DB offline")
@@ -327,12 +343,10 @@ async def get_history(limit: int = 1000):
     try:
         cursor = db.cursor(dictionary=True)
         
-        # First check total records
         cursor.execute("SELECT COUNT(*) as total FROM sensor_data")
         total = cursor.fetchone()['total']
         logger.info(f"📊 Total records in sensor_data: {total}")
         
-        # Get data from last 2 days using INTERVAL
         cursor.execute("""
             SELECT 
                 moisture_level as moisture,
@@ -351,20 +365,13 @@ async def get_history(limit: int = 1000):
         rows = cursor.fetchall()
         logger.info(f"📊 Query returned {len(rows)} rows from last 2 days")
         
-        if rows:
-            logger.info(f"📊 First row: {rows[0]}")
-            logger.info(f"📊 Last row: {rows[-1]}")
-        
         cursor.close()
         
-        # Return data in ascending order (oldest to newest)
         result = [{
             "moisture": float(h['moisture']),
             "water": float(h['water']),
             "timestamp": h['created_at'].isoformat() if hasattr(h['created_at'], 'isoformat') else str(h['created_at'])
         } for h in rows]
-        
-        logger.info(f"📊 Returning {len(result)} history records")
         
         return result
     except Error as e:
@@ -375,33 +382,68 @@ async def get_history(limit: int = 1000):
 
 @app.post("/api/sensor/save")
 async def save_sensor(data: SensorData):
+    """
+    FIX: Improved sensor data saving with better error handling
+    """
     db = get_db()
     if not db:
+        logger.error("❌ Database connection failed in save_sensor")
         raise HTTPException(status_code=500, detail="DB offline")
     
     try:
         now = get_local_time()
+        
+        # Hitung pump status
         pump_status = calculate_pump_status(db, now)
         
-        cursor = db.cursor()
-        cursor.execute("""
-            INSERT INTO sensor_data (moisture_level, water_level, pump_status)
-            VALUES (%s, %s, %s)
-        """, (data.moisture_level, data.water_level, pump_status))
-        cursor.close()
+        # Validate data
+        if data.moisture_level < 0 or data.moisture_level > 100:
+            logger.warning(f"⚠️ Invalid moisture_level: {data.moisture_level}")
+            data.moisture_level = max(0, min(100, data.moisture_level))
         
-        logger.info(f"💾 Saved: moisture={data.moisture_level}%, water={data.water_level}%, pump={pump_status}")
+        if data.water_level < 0 or data.water_level > 100:
+            logger.warning(f"⚠️ Invalid water_level: {data.water_level}")
+            data.water_level = max(0, min(100, data.water_level))
+        
+        cursor = db.cursor()
+        
+        # FIX: Explicit insert with error handling
+        try:
+            cursor.execute("""
+                INSERT INTO sensor_data (moisture_level, water_level, pump_status, created_at)
+                VALUES (%s, %s, %s, %s)
+            """, (data.moisture_level, data.water_level, pump_status, now))
+            
+            # Verify insert
+            insert_id = cursor.lastrowid
+            logger.info(f"💾 Saved ID={insert_id}: moisture={data.moisture_level}%, water={data.water_level}%, pump={pump_status}")
+            
+        except Error as insert_error:
+            logger.error(f"❌ Insert error: {insert_error}")
+            cursor.close()
+            db.close()
+            raise HTTPException(status_code=500, detail=f"Insert failed: {str(insert_error)}")
+        
+        cursor.close()
         
         return {
             "status": "success",
             "command": pump_status,
-            "timestamp": now.isoformat()
+            "timestamp": now.isoformat(),
+            "data_saved": {
+                "moisture": data.moisture_level,
+                "water": data.water_level
+            }
         }
-    except Error as e:
-        logger.error(f"❌ Save error: {e}")
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ Save sensor error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
     finally:
-        db.close()
+        if db:
+            db.close()
 
 @app.post("/api/control/update")
 async def update_control(update: ControlUpdate):
@@ -420,13 +462,14 @@ async def update_control(update: ControlUpdate):
             minutes = update.minutes or 30
             pause_until = now + timedelta(minutes=minutes)
             
+            # FIX: Set ke AUTO mode saat pause (bukan MANUAL_OFF)
             cursor.execute("""
                 UPDATE pump_control 
                 SET manual_mode = 'AUTO', pause_end_time = %s 
                 WHERE id = 1
             """, (pause_until,))
             
-            logger.info(f"⏸️ Pause for {minutes} minutes until {pause_until}, mode set to AUTO")
+            logger.info(f"⏸️ Pause for {minutes} minutes until {pause_until}, mode=AUTO")
             msg = f"Pause set for {minutes} minutes"
         
         elif action == "MANUAL_ON":
@@ -435,7 +478,7 @@ async def update_control(update: ControlUpdate):
                 SET manual_mode = 'MANUAL_ON', pause_end_time = NULL 
                 WHERE id = 1
             """)
-            logger.info(f"🔌 MANUAL_ON activated, pause cleared")
+            logger.info(f"🔌 MANUAL_ON activated")
             msg = "Manual ON activated"
         
         elif action == "MANUAL_OFF":
@@ -444,7 +487,7 @@ async def update_control(update: ControlUpdate):
                 SET manual_mode = 'MANUAL_OFF', pause_end_time = NULL 
                 WHERE id = 1
             """)
-            logger.info(f"🔌 MANUAL_OFF activated, pause cleared")
+            logger.info(f"🔌 MANUAL_OFF activated")
             msg = "Manual OFF activated"
         
         elif action == "AUTO":
@@ -453,7 +496,7 @@ async def update_control(update: ControlUpdate):
                 SET manual_mode = 'AUTO', pause_end_time = NULL 
                 WHERE id = 1
             """)
-            logger.info(f"📅 AUTO mode activated, pause cleared")
+            logger.info(f"📅 AUTO mode activated")
             msg = "Auto mode activated"
         
         else:
@@ -463,7 +506,7 @@ async def update_control(update: ControlUpdate):
         cursor.close()
         
         new_status = calculate_pump_status(db, now)
-        logger.info(f"📊 New pump status after control: {new_status}")
+        logger.info(f"📊 New pump status: {new_status}")
         
         return {
             "status": "success",
@@ -554,9 +597,6 @@ async def get_schedule():
 
 @app.delete("/api/schedule/delete")
 async def delete_schedule():
-    """
-    Delete ALL schedules from database and reset system to AUTO mode
-    """
     db = get_db()
     if not db:
         raise HTTPException(status_code=500, detail="DB offline")
@@ -565,14 +605,11 @@ async def delete_schedule():
         logger.info(f"🗑️ Deleting ALL schedules from database")
         cursor = db.cursor()
         
-        # DELETE all schedules (completely remove from database)
         cursor.execute("DELETE FROM pump_schedules")
         deleted_count = cursor.rowcount
         
-        # RESET auto-increment ID to 1
         cursor.execute("ALTER TABLE pump_schedules AUTO_INCREMENT = 1")
         
-        # Reset pump control to AUTO mode with no pause
         cursor.execute("""
             UPDATE pump_control 
             SET manual_mode = 'AUTO', pause_end_time = NULL 
@@ -580,7 +617,7 @@ async def delete_schedule():
         """)
         
         cursor.close()
-        logger.info(f"✅ {deleted_count} schedule(s) permanently deleted, auto-increment reset, system reset to AUTO mode")
+        logger.info(f"✅ {deleted_count} schedule(s) deleted, system reset to AUTO")
         
         return {
             "status": "success",
