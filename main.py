@@ -569,6 +569,9 @@ async def delete_schedule():
         cursor.execute("DELETE FROM pump_schedules")
         deleted_count = cursor.rowcount
         
+        # RESET auto-increment ID to 1
+        cursor.execute("ALTER TABLE pump_schedules AUTO_INCREMENT = 1")
+        
         # Reset pump control to AUTO mode with no pause
         cursor.execute("""
             UPDATE pump_control 
@@ -577,7 +580,7 @@ async def delete_schedule():
         """)
         
         cursor.close()
-        logger.info(f"✅ {deleted_count} schedule(s) permanently deleted, system reset to AUTO mode")
+        logger.info(f"✅ {deleted_count} schedule(s) permanently deleted, auto-increment reset, system reset to AUTO mode")
         
         return {
             "status": "success",
