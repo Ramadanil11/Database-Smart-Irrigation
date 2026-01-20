@@ -12,7 +12,7 @@ import asyncio
 
 load_dotenv()
 
-app = FastAPI(title="Smart Irrigation API v8.2")
+app = FastAPI(title="Smart Irrigation API v8.3")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -279,7 +279,7 @@ async def startup():
 
 @app.get("/")
 async def root():
-    return {"status": "online", "version": "8.2", "features": ["auto_pause_check", "2_days_history"]}
+    return {"status": "online", "version": "8.3", "features": ["auto_pause_check", "2_days_history", "delete_schedule"]}
 
 @app.get("/health")
 async def health():
@@ -548,6 +548,43 @@ async def get_schedule():
         return {"on_time": None, "off_time": None, "is_active": False}
     except Error as e:
         logger.error(f"❌ Schedule error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        db.close()
+
+@app.delete("/api/schedule/delete")
+async def delete_schedule():
+    """
+    Delete the active schedule and reset system to AUTO mode
+    """
+    db = get_db()
+    if not db:
+        raise HTTPException(status_code=500, detail="DB offline")
+    
+    try:
+        logger.info(f"🗑️ Deleting active schedule")
+        cursor = db.cursor()
+        
+        # Deactivate all schedules
+        cursor.execute("UPDATE pump_schedules SET is_active = FALSE")
+        
+        # Reset pump control to AUTO mode with no pause
+        cursor.execute("""
+            UPDATE pump_control 
+            SET manual_mode = 'AUTO', pause_end_time = NULL 
+            WHERE id = 1
+        """)
+        
+        cursor.close()
+        logger.info(f"✅ Schedule deleted, system reset to AUTO mode (no active schedule)")
+        
+        return {
+            "status": "success",
+            "message": "Schedule deleted successfully",
+            "mode": "AUTO"
+        }
+    except Error as e:
+        logger.error(f"❌ Delete schedule error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         db.close()
