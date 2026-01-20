@@ -12,7 +12,7 @@ import asyncio
 
 load_dotenv()
 
-app = FastAPI(title="Smart Irrigation API v8.1")
+app = FastAPI(title="Smart Irrigation API v8.2")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -228,7 +228,7 @@ async def auto_check_pause_expiry():
     """Background task to check pause expiry every 10 seconds"""
     while True:
         try:
-            await asyncio.sleep(10)  # Check every 10 seconds
+            await asyncio.sleep(10)
             
             db = get_db()
             if not db:
@@ -238,7 +238,6 @@ async def auto_check_pause_expiry():
                 now = get_local_time()
                 cursor = db.cursor(dictionary=True)
                 
-                # Check if there's an active pause
                 cursor.execute("SELECT pause_end_time, manual_mode FROM pump_control WHERE id = 1")
                 control = cursor.fetchone()
                 
@@ -250,14 +249,11 @@ async def auto_check_pause_expiry():
                     else:
                         pause_dt = pause_end_time
                     
-                    # Check if pause has expired
                     if now >= pause_dt:
                         logger.info(f"🔄 Auto-check: Pause expired, forcing status update")
                         
-                        # Calculate new status (this will clear pause and reset to AUTO)
                         new_status = calculate_pump_status(db, now)
                         
-                        # Force save to sensor_data to trigger ESP32 update
                         cursor.execute("""
                             INSERT INTO sensor_data (moisture_level, water_level, pump_status)
                             SELECT 
@@ -278,13 +274,12 @@ async def auto_check_pause_expiry():
 @app.on_event("startup")
 async def startup():
     migrate_db()
-    # Start background task untuk auto-check pause expiry
     asyncio.create_task(auto_check_pause_expiry())
     logger.info("✅ Auto-check pause expiry task started")
 
 @app.get("/")
 async def root():
-    return {"status": "online", "version": "8.1", "features": ["auto_pause_check"]}
+    return {"status": "online", "version": "8.2", "features": ["auto_pause_check", "2_days_history"]}
 
 @app.get("/health")
 async def health():
@@ -320,25 +315,61 @@ async def get_latest():
         db.close()
 
 @app.get("/api/sensor/history")
-async def get_history(limit: int = 100):
+async def get_history(limit: int = 1000):
+    """
+    Get sensor history for the last 2 days
+    Returns data ordered from oldest to newest for chart display
+    """
     db = get_db()
     if not db:
         raise HTTPException(status_code=500, detail="DB offline")
     
     try:
         cursor = db.cursor(dictionary=True)
+        
+        # First check total records
+        cursor.execute("SELECT COUNT(*) as total FROM sensor_data")
+        total = cursor.fetchone()['total']
+        logger.info(f"📊 Total records in sensor_data: {total}")
+        
+        # Get data from last 2 days using INTERVAL
         cursor.execute("""
-            SELECT moisture_level, water_level FROM sensor_data 
-            WHERE created_at >= DATE_SUB(NOW(), INTERVAL 24 HOUR)
-            ORDER BY created_at ASC LIMIT %s
+            SELECT 
+                moisture_level as moisture,
+                water_level as water,
+                created_at,
+                pump_status
+            FROM sensor_data 
+            WHERE created_at >= DATE_SUB(
+                (SELECT MAX(created_at) FROM sensor_data), 
+                INTERVAL 2 DAY
+            )
+            ORDER BY created_at ASC
+            LIMIT %s
         """, (limit,))
+        
         rows = cursor.fetchall()
+        logger.info(f"📊 Query returned {len(rows)} rows from last 2 days")
+        
+        if rows:
+            logger.info(f"📊 First row: {rows[0]}")
+            logger.info(f"📊 Last row: {rows[-1]}")
+        
         cursor.close()
         
-        return [{
-            "moisture": float(h['moisture_level']),
-            "water": float(h['water_level'])
+        # Return data in ascending order (oldest to newest)
+        result = [{
+            "moisture": float(h['moisture']),
+            "water": float(h['water']),
+            "timestamp": h['created_at'].isoformat() if hasattr(h['created_at'], 'isoformat') else str(h['created_at'])
         } for h in rows]
+        
+        logger.info(f"📊 Returning {len(result)} history records")
+        
+        return result
+    except Error as e:
+        logger.error(f"❌ History error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
     finally:
         db.close()
 
@@ -389,7 +420,6 @@ async def update_control(update: ControlUpdate):
             minutes = update.minutes or 30
             pause_until = now + timedelta(minutes=minutes)
             
-            # FIX: Saat PAUSE, set manual_mode ke AUTO agar setelah pause selesai langsung cek schedule
             cursor.execute("""
                 UPDATE pump_control 
                 SET manual_mode = 'AUTO', pause_end_time = %s 
@@ -400,7 +430,6 @@ async def update_control(update: ControlUpdate):
             msg = f"Pause set for {minutes} minutes"
         
         elif action == "MANUAL_ON":
-            # FIX: Clear pause saat manual control
             cursor.execute("""
                 UPDATE pump_control 
                 SET manual_mode = 'MANUAL_ON', pause_end_time = NULL 
@@ -410,7 +439,6 @@ async def update_control(update: ControlUpdate):
             msg = "Manual ON activated"
         
         elif action == "MANUAL_OFF":
-            # FIX: Clear pause saat manual control
             cursor.execute("""
                 UPDATE pump_control 
                 SET manual_mode = 'MANUAL_OFF', pause_end_time = NULL 
@@ -420,7 +448,6 @@ async def update_control(update: ControlUpdate):
             msg = "Manual OFF activated"
         
         elif action == "AUTO":
-            # FIX: Clear pause dan kembalikan ke AUTO
             cursor.execute("""
                 UPDATE pump_control 
                 SET manual_mode = 'AUTO', pause_end_time = NULL 
@@ -435,7 +462,6 @@ async def update_control(update: ControlUpdate):
         
         cursor.close()
         
-        # FIX: Immediately calculate new pump status after control update
         new_status = calculate_pump_status(db, now)
         logger.info(f"📊 New pump status after control: {new_status}")
         
@@ -461,16 +487,13 @@ async def add_schedule(data: ScheduleData):
         logger.info(f"📅 Adding schedule: {data.on_time} - {data.off_time}")
         cursor = db.cursor()
         
-        # Clear existing schedules
         cursor.execute("UPDATE pump_schedules SET is_active = FALSE")
         
-        # Add new schedule
         cursor.execute("""
             INSERT INTO pump_schedules (on_time, off_time, is_active)
             VALUES (%s, %s, TRUE)
         """, (data.on_time, data.off_time))
         
-        # FIX: Saat schedule ditambahkan, reset ke AUTO mode (clear manual override)
         cursor.execute("""
             UPDATE pump_control 
             SET manual_mode = 'AUTO', pause_end_time = NULL 
